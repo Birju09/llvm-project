@@ -220,7 +220,7 @@ typedef kmp_uint32 kmp_uint;
 // stdarg handling
 #if (KMP_ARCH_ARM || KMP_ARCH_X86_64 || KMP_ARCH_AARCH64 || KMP_ARCH_WASM) &&  \
     (KMP_OS_FREEBSD || KMP_OS_NETBSD || KMP_OS_OPENBSD || KMP_OS_DRAGONFLY ||  \
-     KMP_OS_LINUX || KMP_OS_WASI)
+     KMP_OS_LINUX || KMP_OS_WASI || KMP_OS_QNX)
 typedef va_list *kmp_va_list;
 #define kmp_va_deref(ap) (*(ap))
 #define kmp_va_addr_of(ap) (&(ap))
