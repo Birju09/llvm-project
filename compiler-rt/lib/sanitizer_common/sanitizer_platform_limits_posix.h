@@ -579,7 +579,7 @@ typedef long long __sanitizer_clock_t;
 typedef long __sanitizer_clock_t;
 #  endif
 
-#  if SANITIZER_LINUX || SANITIZER_HAIKU
+#  if SANITIZER_LINUX || SANITIZER_HAIKU || SANITIZER_QNX
 typedef int __sanitizer_clockid_t;
 typedef unsigned long long __sanitizer_eventfd_t;
 #  endif
@@ -616,7 +616,11 @@ typedef struct {
 // This thing depends on the platform. We are only interested in the upper
 // limit. Verified with a compiler assert in .cpp.
 union __sanitizer_pthread_attr_t {
+#if SANITIZER_QNX
+  char size[256];
+#else
   char size[128];
+#endif
   void *align;
 };
 
@@ -630,6 +634,9 @@ typedef unsigned long __sanitizer_sigset_t;
 typedef unsigned __sanitizer_sigset_t;
 #  elif SANITIZER_HAIKU
 typedef unsigned long __sanitizer_sigset_t;
+#  elif SANITIZER_QNX
+// QNX sigset_t is unsigned long long (8 bytes)
+typedef unsigned long long __sanitizer_sigset_t;
 #  elif SANITIZER_LINUX
 struct __sanitizer_sigset_t {
   // The size is determined by looking at sizeof of real sigset_t on linux.

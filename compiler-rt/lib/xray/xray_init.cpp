@@ -15,7 +15,12 @@
 #include <strings.h>
 #include <unistd.h>
 
+#if SANITIZER_QNX
+#include <sys/procmgr.h>
+#endif
+
 #include "sanitizer_common/sanitizer_common.h"
+#include "sanitizer_common/sanitizer_platform.h"
 #include "xray/xray_interface.h"
 #include "xray_allocator.h"
 #include "xray_defs.h"
@@ -129,6 +134,43 @@ void __xray_init() XRAY_NEVER_INSTRUMENT {
 
   // XRAY is not compatible with PaX MPROTECT
   CheckMPROTECT();
+
+#if SANITIZER_QNX
+  // XRay patches executable code at runtime. On QNX this requires process
+  // abilities. Try to activate them now; each call succeeds only if the ability
+  // is already in the process's allowed set.
+  //
+  // PROCMGR_AID_PROT_WRITE_AND_EXEC (optional, fast path): allows
+  //   mprotect(PROT_READ|PROT_WRITE|PROT_EXEC) on existing mappings directly.
+  //   Avoids copying the text segment — strongly recommended for performance.
+  //   Grant with: on -A+prot_write_and_exec /path/to/app
+  //
+  // PROCMGR_AID_PROT_EXEC (required, slow-path fallback): allows
+  //   mprotect(PROT_READ|PROT_EXEC) on anonymous pages (RW→RX transition).
+  //   Grant with: on -A+prot_exec /path/to/app
+  // Request abilities for both root and non-root domains. On QNX, root does
+  // NOT automatically bypass procmgr ability checks — they must be explicitly
+  // granted regardless of UID.
+  unsigned Domains[] = {PROCMGR_ADN_ROOT, PROCMGR_ADN_NONROOT};
+  int AbilityRet = 0;
+  for (unsigned D : Domains) {
+    procmgr_ability(
+        0,
+        D | PROCMGR_AOP_ALLOW | PROCMGR_AID_PROT_WRITE_AND_EXEC,
+        D | PROCMGR_AOP_LOCK | PROCMGR_AID_PROT_WRITE_AND_EXEC,
+        PROCMGR_AID_EOL);
+    AbilityRet |= procmgr_ability(
+        0,
+        D | PROCMGR_AOP_ALLOW | PROCMGR_AID_PROT_EXEC,
+        D | PROCMGR_AOP_LOCK | PROCMGR_AID_PROT_EXEC,
+        PROCMGR_AID_EOL);
+  }
+  if (AbilityRet != 0) {
+    Report("XRay: WARNING: failed to acquire PROCMGR_AID_PROT_EXEC ability "
+           "(errno=%d). XRay sled patching may fail with SIGILL.\n",
+           errno);
+  }
+#endif
 
   if (!atomic_load(&XRayFlagsInitialized, memory_order_acquire)) {
     initializeFlags();

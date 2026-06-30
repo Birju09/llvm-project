@@ -36,9 +36,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#if SANITIZER_FREEBSD
-// The MAP_NORESERVE define has been removed in FreeBSD 11.x, and even before
-// that, it was never implemented.  So just define it to zero.
+#if SANITIZER_FREEBSD || SANITIZER_QNX
+// MAP_NORESERVE is not available on FreeBSD or QNX.
 #undef MAP_NORESERVE
 #define MAP_NORESERVE 0
 #endif

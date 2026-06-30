@@ -15,7 +15,8 @@
 #if !defined(__linux__) && !defined(__FreeBSD__) && !defined(__NetBSD__) && \
     !defined(__APPLE__) && !defined(_WIN32) && !defined(__Fuchsia__) &&     \
     !(defined(__sun__) && defined(__svr4__)) && !defined(__HAIKU__) &&      \
-    !defined(__wasi__) && !defined(__QNXNTO__)
+    !defined(__wasi__) && !defined(__QNXNTO__) && !defined(__QNX__) &&     \
+    !defined(QNX_OS_SAFETY)
 #  error "This operating system is not supported"
 #endif
 
@@ -68,7 +69,7 @@
 #  define SANITIZER_WASI 0
 #endif
 
-#if defined(__QNXNTO__)
+#if defined(__QNXNTO__) || defined(__QNX__) || defined(QNX_OS_SAFETY)
 #  define SANITIZER_QNX 1
 #else
 #  define SANITIZER_QNX 0
@@ -435,6 +436,8 @@
 #if SANITIZER_FREEBSD || SANITIZER_APPLE || SANITIZER_NETBSD || \
     SANITIZER_SOLARIS || SANITIZER_HAIKU
 #  define SANITIZER_MADVISE_DONTNEED MADV_FREE
+#elif SANITIZER_QNX
+#  define SANITIZER_MADVISE_DONTNEED POSIX_MADV_DONTNEED
 #else
 #  define SANITIZER_MADVISE_DONTNEED MADV_DONTNEED
 #endif

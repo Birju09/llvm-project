@@ -105,6 +105,10 @@ void tools::QNX::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   }
 
   addLinkerCompressDebugSectionsOption(ToolChain, Args, CmdArgs);
+
+  bool NeedsSanitizerDeps = addSanitizerRuntimes(ToolChain, Args, CmdArgs);
+  bool NeedsXRayDeps = addXRayRuntime(ToolChain, Args, CmdArgs);
+
   AddLinkerInputs(ToolChain, Inputs, Args, CmdArgs, JA);
 
   if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nodefaultlibs,
@@ -156,6 +160,11 @@ void tools::QNX::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(Args.MakeArgString(ToolChain.GetFilePath("crtend.o")));
     CmdArgs.push_back(Args.MakeArgString(ToolChain.GetFilePath("crtn.o")));
   }
+
+  if (NeedsSanitizerDeps)
+    linkSanitizerRuntimeDeps(ToolChain, Args, CmdArgs);
+  if (NeedsXRayDeps)
+    linkXRayRuntimeDeps(ToolChain, Args, CmdArgs);
 
   ToolChain.addProfileRTLibs(Args, CmdArgs);
 

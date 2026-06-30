@@ -62,6 +62,11 @@ struct XRAY_TLS_ALIGNAS(64) ThreadLocalData {
   using ControllerStorage = std::byte[sizeof(FDRController<>)];
   alignas(FDRController<>) ControllerStorage CStorage;
   FDRController<> *Controller = nullptr;
+
+  // Tracks the FDR session generation. When the global SessionGeneration
+  // advances (due to a log rotation), threads flush and re-setup their
+  // controller so they write into the new buffer queue generation.
+  u64 SessionGeneration = 0;
 };
 
 } // namespace
@@ -84,6 +89,10 @@ static atomic_uint64_t TicksPerSec{0};
 
 static atomic_sint32_t LogFlushStatus = {
     XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING};
+
+// Incremented each time a log rotation occurs. Threads compare their local
+// copy to detect a rotation and re-initialize their FDR controller.
+static atomic_uint64_t SessionGeneration{0};
 
 // This function will initialize the thread-local data structure used by the FDR
 // logging implementation and return a reference to it. The implementation
@@ -380,6 +389,105 @@ XRayLogFlushStatus fdrLoggingFlush() XRAY_NEVER_INSTRUMENT {
   return XRayLogFlushStatus::XRAY_LOG_FLUSHED;
 }
 
+// fdrLoggingRotate() flushes all current FDR buffers to a new log file and
+// resets the buffer queue so logging continues seamlessly into fresh buffers.
+// Unlike fdrLoggingFlush(), this does NOT require finalization first and does
+// NOT change the INITIALIZED logging status. Use this for periodic flushing.
+XRayLogFlushStatus fdrLoggingRotate() XRAY_NEVER_INSTRUMENT {
+  if (atomic_load(&LoggingStatus, memory_order_acquire) !=
+      XRayLogInitStatus::XRAY_LOG_INITIALIZED) {
+    if (Verbosity())
+      Report("XRay FDR: Cannot rotate; logging not initialized.\n");
+    return XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING;
+  }
+
+  if (atomic_exchange(&LogFlushStatus, XRayLogFlushStatus::XRAY_LOG_FLUSHING,
+                      memory_order_release) ==
+      XRayLogFlushStatus::XRAY_LOG_FLUSHING) {
+    if (Verbosity())
+      Report("XRay FDR: Rotation already in progress.\n");
+    return XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING;
+  }
+
+  if (BQ == nullptr) {
+    if (Verbosity())
+      Report("XRay FDR: Cannot rotate; buffer queue is null.\n");
+    atomic_store(&LogFlushStatus, XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING,
+                 memory_order_release);
+    return XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING;
+  }
+
+  // Finalize the current buffer queue to drain in-flight records.
+  BQ->finalize();
+
+  // Give threads time to notice the BQ is finalized and flush their buffers.
+  SleepForMillis(fdrFlags()->grace_period_ms);
+
+  // Flush the current thread's in-flight buffer.
+  auto &TLD = getThreadLocalData();
+  if (TLD.Controller != nullptr) {
+    TLD.Controller->flush();
+    TLD.Controller = nullptr;
+  }
+
+  if (!fdrFlags()->no_file_flush) {
+    LogWriter *LW = LogWriter::Open();
+    if (LW == nullptr) {
+      atomic_store(&LogFlushStatus, XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING,
+                   memory_order_release);
+      // Re-init the BQ so logging can continue even though the file open failed.
+      BQ->init(fdrFlags()->buffer_size, fdrFlags()->buffer_max);
+      atomic_fetch_add(&SessionGeneration, 1, memory_order_release);
+      return XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING;
+    }
+
+    XRayFileHeader Header = fdrCommonHeaderInfo();
+    Header.FdrData = FdrAdditionalHeaderData{BQ->ConfiguredBufferSize()};
+    LW->WriteAll(reinterpret_cast<char *>(&Header),
+                 reinterpret_cast<char *>(&Header) + sizeof(Header));
+
+    BQ->apply([&](const BufferQueue::Buffer &B) {
+      MetadataRecord ExtentsRecord;
+      auto BufferExtents = atomic_load(B.Extents, memory_order_acquire);
+      DCHECK(BufferExtents <= B.Size);
+      ExtentsRecord.Type = uint8_t(RecordType::Metadata);
+      ExtentsRecord.RecordKind =
+          uint8_t(MetadataRecord::RecordKinds::BufferExtents);
+      internal_memcpy(ExtentsRecord.Data, &BufferExtents, sizeof(BufferExtents));
+      if (BufferExtents > 0) {
+        LW->WriteAll(reinterpret_cast<char *>(&ExtentsRecord),
+                     reinterpret_cast<char *>(&ExtentsRecord) +
+                         sizeof(MetadataRecord));
+        LW->WriteAll(reinterpret_cast<char *>(B.Data),
+                     reinterpret_cast<char *>(B.Data) + BufferExtents);
+      }
+    });
+
+    LogWriter::Close(LW);
+  }
+
+  // Re-initialize the buffer queue for the next recording window.
+  if (BQ->init(fdrFlags()->buffer_size, fdrFlags()->buffer_max) !=
+      BufferQueue::ErrorCode::Ok) {
+    if (Verbosity())
+      Report("XRay FDR: Failed to re-initialize buffer queue after rotate.\n");
+    atomic_store(&LogFlushStatus, XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING,
+                 memory_order_release);
+    return XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING;
+  }
+
+  // Bump the generation so all threads re-setup their FDR controllers and
+  // write into the fresh buffer queue on their next instrumented call.
+  atomic_fetch_add(&SessionGeneration, 1, memory_order_release);
+
+  atomic_store(&LogFlushStatus, XRayLogFlushStatus::XRAY_LOG_FLUSHED,
+               memory_order_release);
+
+  if (Verbosity())
+    Report("XRay FDR: Log rotated successfully.\n");
+  return XRayLogFlushStatus::XRAY_LOG_FLUSHED;
+}
+
 XRayLogInitStatus fdrLoggingFinalize() XRAY_NEVER_INSTRUMENT {
   s32 CurrentStatus = XRayLogInitStatus::XRAY_LOG_INITIALIZED;
   if (!atomic_compare_exchange_strong(&LoggingStatus, &CurrentStatus,
@@ -450,6 +558,20 @@ static bool setupTLD(ThreadLocalData &TLD) XRAY_NEVER_INSTRUMENT {
         TLD.Controller = nullptr;
       }
       return false;
+    }
+  }
+
+  // If the session generation has advanced (log was rotated), flush the current
+  // controller and reset it so we pick up fresh buffers from the new generation.
+  {
+    auto CurrentGeneration =
+        atomic_load(&SessionGeneration, memory_order_acquire);
+    if (TLD.SessionGeneration != CurrentGeneration) {
+      if (TLD.Controller != nullptr) {
+        TLD.Controller->flush();
+        TLD.Controller = nullptr;
+      }
+      TLD.SessionGeneration = CurrentGeneration;
     }
   }
 
@@ -720,6 +842,15 @@ XRayLogInitStatus fdrLoggingInit(size_t, size_t, void *Options,
     Report("XRay FDR init successful.\n");
   return XRayLogInitStatus::XRAY_LOG_INITIALIZED;
 }
+
+} // namespace __xray
+
+// Public C API for periodic log rotation.
+XRayLogFlushStatus __xray_fdr_rotate_log() XRAY_NEVER_INSTRUMENT {
+  return __xray::fdrLoggingRotate();
+}
+
+namespace __xray {
 
 bool fdrLogDynamicInitializer() XRAY_NEVER_INSTRUMENT {
   XRayLogImpl Impl{

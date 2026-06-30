@@ -12,7 +12,7 @@
 
 #include "sanitizer_platform.h"
 #if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD || \
-    SANITIZER_SOLARIS || SANITIZER_HAIKU
+    SANITIZER_SOLARIS || SANITIZER_HAIKU || SANITIZER_QNX
 #include "sanitizer_common.h"
 #include "sanitizer_stacktrace.h"
 
@@ -24,6 +24,12 @@
 #define _GNU_SOURCE  // to declare _Unwind_Backtrace() from <unwind.h>
 #endif
 #include <unwind.h>
+
+#if SANITIZER_QNX
+// QNX's <unwind.h> does not declare _Unwind_Backtrace, but the function is
+// available in the C++ runtime (libgcc_s / libunwind). Declare it manually.
+extern "C" _Unwind_Reason_Code _Unwind_Backtrace(_Unwind_Trace_Fn, void *);
+#endif
 
 namespace __sanitizer {
 
@@ -139,4 +145,4 @@ void BufferedStackTrace::UnwindSlow(uptr pc, void *context, u32 max_depth) {
 }  // namespace __sanitizer
 
 #endif  // SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD ||
-        // SANITIZER_SOLARIS || SANITIZER_HAIKU
+        // SANITIZER_SOLARIS || SANITIZER_HAIKU || SANITIZER_QNX

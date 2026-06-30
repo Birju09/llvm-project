@@ -45,7 +45,11 @@
 #  endif
 
 #  include <dlfcn.h>  // for dlsym()
+#  if SANITIZER_QNX
+#  include <sys/link.h>
+#  else
 #  include <link.h>
+#  endif
 #  include <pthread.h>
 #  include <signal.h>
 #  include <sys/mman.h>
@@ -74,6 +78,11 @@ extern "C" int __sys_sigaction(int signum, const struct sigaction *act,
                                struct sigaction *oldact);
 #  endif
 
+#  if SANITIZER_QNX
+#    undef MAP_NORESERVE
+#    define MAP_NORESERVE 0
+#  endif
+
 #  if SANITIZER_NETBSD
 #    include <lwp.h>
 #    include <sys/sysctl.h>
@@ -92,7 +101,11 @@ extern "C" int __sys_sigaction(int signum, const struct sigaction *act,
 #  endif
 
 #  if !SANITIZER_ANDROID
-#    include <elf.h>
+#    if SANITIZER_QNX
+#      include <sys/elf.h>
+#    else
+#      include <elf.h>
+#    endif
 #    include <unistd.h>
 #  endif
 
@@ -179,11 +192,37 @@ void GetThreadStackTopAndBottom(bool at_initialization, uptr *stack_top,
   stacksize = ss.ss_size;
   stackaddr = (char *)ss.ss_sp - stacksize;
 #  else   // !SANITIZER_SOLARIS
+#    if SANITIZER_QNX
+  {
+    // QNX supports pthread_attr_get_np to query thread attributes
+    // (similar to FreeBSD's pthread_attr_get_np / Linux's pthread_getattr_np).
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    if (pthread_attr_get_np(pthread_self(), &attr) == 0) {
+      internal_pthread_attr_getstack(&attr, &stackaddr, &stacksize);
+    }
+    pthread_attr_destroy(&attr);
+    if (stacksize == 0) {
+      // Fallback: estimate from RLIMIT_STACK and current SP.
+      volatile uptr stack_var = 0;
+      uptr cur_sp = (uptr)&stack_var;
+      struct rlimit rl;
+      getrlimit(RLIMIT_STACK, &rl);
+      stacksize = (rl.rlim_cur != RLIM_INFINITY)
+                      ? (uptr)rl.rlim_cur
+                      : (uptr)(8 * 1024 * 1024);
+      stackaddr =
+          reinterpret_cast<void *>(RoundDownTo(cur_sp, GetPageSizeCached()) +
+                                   GetPageSizeCached() - stacksize);
+    }
+  }
+#    else
   pthread_attr_t attr;
   pthread_attr_init(&attr);
   CHECK_EQ(pthread_getattr_np(pthread_self(), &attr), 0);
   internal_pthread_attr_getstack(&attr, &stackaddr, &stacksize);
   pthread_attr_destroy(&attr);
+#    endif
 #  endif  // SANITIZER_SOLARIS
 
   *stack_top = (uptr)stackaddr + stacksize;
@@ -654,7 +693,9 @@ static void GetTls(uptr *addr, uptr *size) {
       *addr = (uptr)tcb->tcb_dtv[1];
     }
   }
-#    elif SANITIZER_HAIKU
+#    elif SANITIZER_HAIKU || SANITIZER_QNX
+  *addr = 0;
+  *size = 0;
 #    else
 #      error "Unknown OS"
 #    endif
@@ -705,10 +746,11 @@ void GetThreadStackAndTls(bool main, uptr *stk_begin, uptr *stk_end,
 #  endif
 }
 
-#  if !SANITIZER_FREEBSD
+#  if !SANITIZER_FREEBSD && !SANITIZER_QNX
 typedef ElfW(Phdr) Elf_Phdr;
 #  endif
 
+#  if !SANITIZER_QNX
 struct DlIteratePhdrData {
   InternalMmapVectorNoCtor<LoadedModule> *modules;
   bool first;
@@ -784,12 +826,17 @@ static int dl_iterate_phdr_cb(dl_phdr_info *info, size_t size, void *arg) {
 }
 
 void ListOfModules::init() {
+#  if SANITIZER_QNX
+  clear();
+#  else
   clearOrInit();
   DlIteratePhdrData data = {&modules_, true};
   dl_iterate_phdr(dl_iterate_phdr_cb, &data);
+#  endif
 }
 
 void ListOfModules::fallbackInit() { clear(); }
+#endif  // !SANITIZER_QNX
 
 // getrusage does not give us the current RSS, only the max RSS.
 // Still, this is better than nothing if /proc/self/statm is not available
@@ -847,6 +894,8 @@ u32 GetNumberOfCPUs() {
   get_system_info(&info);
   return info.cpu_count;
 #  elif SANITIZER_SOLARIS
+  return sysconf(_SC_NPROCESSORS_ONLN);
+#  elif SANITIZER_QNX
   return sysconf(_SC_NPROCESSORS_ONLN);
 #  else
   cpu_set_t CPUs;

@@ -24,7 +24,8 @@
 // Must go after undef _FILE_OFFSET_BITS.
 #include "sanitizer_platform.h"
 
-#if SANITIZER_LINUX || SANITIZER_APPLE || SANITIZER_HAIKU || SANITIZER_QNX
+#if SANITIZER_LINUX || SANITIZER_APPLE || SANITIZER_HAIKU || SANITIZER_QNX || \
+    defined(__QNXNTO__) || defined(__QNX__) || defined(QNX_OS_SAFETY)
 // Must go after undef _FILE_OFFSET_BITS.
 #include "sanitizer_glibc_version.h"
 
@@ -52,7 +53,7 @@
 #include <time.h>
 #include <wchar.h>
 #include <regex.h>
-#if !SANITIZER_APPLE && !SANITIZER_HAIKU
+#if !SANITIZER_APPLE && !SANITIZER_HAIKU && !SANITIZER_QNX
 #include <utmp.h>
 #endif
 
@@ -61,11 +62,15 @@
 #endif
 
 #if !SANITIZER_ANDROID
-#if !SANITIZER_HAIKU
+#if !SANITIZER_HAIKU && !SANITIZER_QNX
 #include <sys/mount.h>
 #endif
+#if !SANITIZER_QNX
 #include <sys/timeb.h>
+#endif
+#if !SANITIZER_QNX
 #include <utmpx.h>
+#endif
 #endif
 
 #if SANITIZER_LINUX
@@ -113,7 +118,9 @@ typedef struct user_fpregs elf_fpregset_t;
 
 #if !SANITIZER_ANDROID
 #include <ifaddrs.h>
-#if !SANITIZER_HAIKU
+#if SANITIZER_QNX
+#include <ucontext.h>
+#elif !SANITIZER_HAIKU
 #include <sys/ucontext.h>
 #include <wordexp.h>
 #endif
@@ -182,12 +189,18 @@ typedef struct user_fpregs elf_fpregset_t;
 #include <sys/ioctl.h>
 #endif
 
+#if SANITIZER_QNX
+#include <sys/ioctl.h>
+#endif
+
 // Include these after system headers to avoid name clashes and ambiguities.
 #  include "sanitizer_common.h"
 #  include "sanitizer_internal_defs.h"
 #  include "sanitizer_platform_interceptors.h"
 #  include "sanitizer_platform_limits_posix.h"
 
+#if !SANITIZER_QNX && !defined(__QNXNTO__) && !defined(__QNX__) && \
+    !defined(QNX_OS_SAFETY)
 namespace __sanitizer {
   unsigned struct_utsname_sz = sizeof(struct utsname);
   unsigned struct_stat_sz = sizeof(struct stat);
@@ -226,8 +239,10 @@ namespace __sanitizer {
   unsigned struct_fstab_sz = sizeof(struct fstab);
 #endif  // SANITIZER_GLIBC || SANITIZER_FREEBSD || SANITIZER_NETBSD ||
         // SANITIZER_APPLE
-#if !SANITIZER_ANDROID && !SANITIZER_HAIKU
+#if !SANITIZER_ANDROID && !SANITIZER_HAIKU && !SANITIZER_QNX
   unsigned struct_statfs_sz = sizeof(struct statfs);
+#endif
+#if !SANITIZER_ANDROID && !SANITIZER_HAIKU
   unsigned struct_sockaddr_sz = sizeof(struct sockaddr);
 
   unsigned ucontext_t_sz(void *ctx) {
@@ -333,10 +348,10 @@ namespace __sanitizer {
   int shmctl_shm_stat = (int)SHM_STAT;
 #endif
 
-#if !SANITIZER_APPLE && !SANITIZER_FREEBSD && !SANITIZER_HAIKU
+#if !SANITIZER_APPLE && !SANITIZER_FREEBSD && !SANITIZER_HAIKU && !SANITIZER_QNX
   unsigned struct_utmp_sz = sizeof(struct utmp);
 #endif
-#if !SANITIZER_ANDROID
+#if !SANITIZER_ANDROID && !SANITIZER_QNX
   unsigned struct_utmpx_sz = sizeof(struct utmpx);
 #endif
 
@@ -365,9 +380,9 @@ unsigned struct_ElfW_Phdr_sz = sizeof(Elf_Phdr);
   int glob_altdirfunc = GLOB_ALTDIRFUNC;
 #endif
 
-#  if !SANITIZER_ANDROID && !SANITIZER_HAIKU
+#  if !SANITIZER_ANDROID && !SANITIZER_HAIKU && !SANITIZER_QNX
   const int wordexp_wrde_dooffs = WRDE_DOOFFS;
-#  endif  // !SANITIZER_ANDROID && !SANITIZER_HAIKU
+#  endif  // !SANITIZER_ANDROID && !SANITIZER_HAIKU && !SANITIZER_QNX
 
 #  if SANITIZER_LINUX && !SANITIZER_ANDROID &&                               \
       (defined(__i386) || defined(__x86_64) || defined(__mips64) ||          \
@@ -546,7 +561,8 @@ unsigned struct_ElfW_Phdr_sz = sizeof(Elf_Phdr);
   unsigned struct_sock_fprog_sz = sizeof(struct sock_fprog);
 #  endif  // SANITIZER_GLIBC
 
-#  if !SANITIZER_ANDROID && !SANITIZER_APPLE && !SANITIZER_HAIKU
+#  if !SANITIZER_ANDROID && !SANITIZER_APPLE && !SANITIZER_HAIKU && \
+      !SANITIZER_QNX
   unsigned struct_sioc_sg_req_sz = sizeof(struct sioc_sg_req);
   unsigned struct_sioc_vif_req_sz = sizeof(struct sioc_vif_req);
 #endif
@@ -558,7 +574,7 @@ unsigned struct_ElfW_Phdr_sz = sizeof(Elf_Phdr);
   const unsigned IOCTL_NOT_PRESENT = 0;
 
   unsigned IOCTL_FIONBIO = FIONBIO;
-#if !SANITIZER_HAIKU
+#if !SANITIZER_HAIKU && !SANITIZER_QNX
   unsigned IOCTL_FIOASYNC = FIOASYNC;
   unsigned IOCTL_FIOCLEX = FIOCLEX;
   unsigned IOCTL_FIOGETOWN = FIOGETOWN;
@@ -586,7 +602,7 @@ unsigned struct_ElfW_Phdr_sz = sizeof(Elf_Phdr);
   unsigned IOCTL_SIOCSIFNETMASK = SIOCSIFNETMASK;
   unsigned IOCTL_SIOCSPGRP = SIOCSPGRP;
 
-#if !SANITIZER_HAIKU
+#if !SANITIZER_HAIKU && !SANITIZER_QNX
   unsigned IOCTL_TIOCCONS = TIOCCONS;
   unsigned IOCTL_TIOCGETD = TIOCGETD;
   unsigned IOCTL_TIOCNOTTY = TIOCNOTTY;
@@ -1004,6 +1020,8 @@ unsigned struct_ElfW_Phdr_sz = sizeof(Elf_Phdr);
   const int si_SEGV_MAPERR = SEGV_MAPERR;
   const int si_SEGV_ACCERR = SEGV_ACCERR;
 } // namespace __sanitizer
+#endif  // !SANITIZER_QNX && !defined(__QNXNTO__) && !defined(__QNX__) &&
+        // !defined(QNX_OS_SAFETY)
 
 using namespace __sanitizer;
 
@@ -1060,6 +1078,7 @@ CHECK_SIZE_AND_OFFSET(glob_t, gl_lstat);
 CHECK_SIZE_AND_OFFSET(glob_t, gl_stat);
 #endif  // SANITIZER_GLIBC || SANITIZER_FREEBSD
 
+#if !SANITIZER_QNX
 CHECK_TYPE_SIZE(addrinfo);
 CHECK_SIZE_AND_OFFSET(addrinfo, ai_flags);
 CHECK_SIZE_AND_OFFSET(addrinfo, ai_family);
@@ -1194,6 +1213,7 @@ CHECK_SIZE_AND_OFFSET(wordexp_t, we_wordc);
 CHECK_SIZE_AND_OFFSET(wordexp_t, we_wordv);
 CHECK_SIZE_AND_OFFSET(wordexp_t, we_offs);
 #endif
+#endif  // !SANITIZER_QNX
 
 CHECK_TYPE_SIZE(tm);
 CHECK_SIZE_AND_OFFSET(tm, tm_sec);
@@ -1218,7 +1238,7 @@ CHECK_SIZE_AND_OFFSET(mntent, mnt_freq);
 CHECK_SIZE_AND_OFFSET(mntent, mnt_passno);
 #endif
 
-#if !SANITIZER_HAIKU
+#if !SANITIZER_HAIKU && !SANITIZER_QNX
 CHECK_TYPE_SIZE(ether_addr);
 #endif
 
@@ -1252,13 +1272,15 @@ CHECK_SIZE_AND_OFFSET(shmid_ds, shm_lpid);
 CHECK_SIZE_AND_OFFSET(shmid_ds, shm_nattch);
 #endif
 
+#if !SANITIZER_QNX
 CHECK_TYPE_SIZE(clock_t);
+#endif
 
-#if SANITIZER_LINUX
+#if SANITIZER_LINUX && !SANITIZER_QNX
 CHECK_TYPE_SIZE(clockid_t);
 #endif
 
-#if !SANITIZER_ANDROID && !SANITIZER_HAIKU
+#if !SANITIZER_ANDROID && !SANITIZER_HAIKU && !SANITIZER_QNX
 CHECK_TYPE_SIZE(ifaddrs);
 CHECK_SIZE_AND_OFFSET(ifaddrs, ifa_next);
 CHECK_SIZE_AND_OFFSET(ifaddrs, ifa_name);
@@ -1288,7 +1310,7 @@ CHECK_SIZE_AND_OFFSET(ifaddrs, ifa_data);
 COMPILER_CHECK(sizeof(__sanitizer_struct_mallinfo) == sizeof(struct mallinfo));
 #endif
 
-#if !SANITIZER_ANDROID
+#if !SANITIZER_ANDROID && !SANITIZER_QNX
 CHECK_TYPE_SIZE(timeb);
 CHECK_SIZE_AND_OFFSET(timeb, time);
 CHECK_SIZE_AND_OFFSET(timeb, millitm);
@@ -1296,6 +1318,7 @@ CHECK_SIZE_AND_OFFSET(timeb, timezone);
 CHECK_SIZE_AND_OFFSET(timeb, dstflag);
 #endif
 
+#if !SANITIZER_QNX
 CHECK_TYPE_SIZE(passwd);
 CHECK_SIZE_AND_OFFSET(passwd, pw_name);
 CHECK_SIZE_AND_OFFSET(passwd, pw_passwd);
@@ -1313,7 +1336,7 @@ CHECK_SIZE_AND_OFFSET(passwd, pw_change);
 CHECK_SIZE_AND_OFFSET(passwd, pw_expire);
 CHECK_SIZE_AND_OFFSET(passwd, pw_class);
 #endif
-
+#endif
 
 CHECK_TYPE_SIZE(group);
 CHECK_SIZE_AND_OFFSET(group, gr_name);

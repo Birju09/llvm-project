@@ -304,6 +304,16 @@ XRayLogInitStatus __xray_log_finalize();
 /// XRayLogFlushStatus for what the return values mean.
 XRayLogFlushStatus __xray_log_flushLog();
 
+/// Rotates the FDR log: flushes all current in-memory buffers to a new log
+/// file and resets the buffer queue so logging continues without interruption.
+/// Unlike __xray_log_flushLog(), this does NOT require calling
+/// __xray_log_finalize() first and does NOT stop logging. The logging status
+/// remains XRAY_LOG_INITIALIZED throughout. Use this for periodic flushing
+/// during a long-running session.
+///
+/// Returns XRAY_LOG_FLUSHED on success, XRAY_LOG_NOT_FLUSHING otherwise.
+XRayLogFlushStatus __xray_fdr_rotate_log();
+
 /// An XRayBuffer represents a section of memory which can be treated by log
 /// processing functions as bytes stored in the logging implementation's
 /// buffers.

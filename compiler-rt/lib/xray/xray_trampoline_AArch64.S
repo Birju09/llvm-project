@@ -1,6 +1,14 @@
 #include "../builtins/assembly.h"
 #include "../sanitizer_common/sanitizer_asm.h"
 
+// BTI_C: emit a BTI-call landing pad when the target enables BTI by default.
+// Trampolines are reached via BLR (indirect call), so they need BTI C.
+#if defined(__aarch64__) && defined(__ARM_FEATURE_BTI_DEFAULT)
+# define BTI_C hint 34
+#else
+# define BTI_C
+#endif
+
 .macro SAVE_REGISTERS
   stp x1, x2, [sp, #-16]!
   stp x3, x4, [sp, #-16]!
@@ -43,12 +51,13 @@
 ASM_HIDDEN(__xray_FunctionEntry)
 ASM_TYPE_FUNCTION(__xray_FunctionEntry)
 ASM_SYMBOL(__xray_FunctionEntry):
+  BTI_C
     /* Move the return address beyond the end of sled data. The 12 bytes of
          data are inserted in the code of the runtime patch, between the call
          instruction and the instruction returned into. The data contains 32
          bits of instrumented function ID and 64 bits of the address of
          the current trampoline. */
-  add x30, x30, #12
+  add x30, x30, 12
   // Push the registers which may be modified by the handler function.
   SAVE_REGISTERS
 
@@ -57,7 +66,7 @@ ASM_SYMBOL(__xray_FunctionEntry):
   cbz x2, 1f
   // Set w0 to the function ID (w17). Set x1 to XRayEntryType::ENTRY = 0.
   mov w0, w17
-  mov x1, #0
+  mov x1, 0
   // Call the handler with 2 parameters.
   blr x2
 1:
@@ -70,12 +79,13 @@ ASM_SIZE(__xray_FunctionEntry)
 ASM_HIDDEN(__xray_FunctionExit)
 ASM_TYPE_FUNCTION(__xray_FunctionExit)
 ASM_SYMBOL(__xray_FunctionExit):
+  BTI_C
     /* Move the return address beyond the end of sled data. The 12 bytes of
          data are inserted in the code of the runtime patch, between the call
          instruction and the instruction returned into. The data contains 32
          bits of instrumented function ID and 64 bits of the address of
          the current trampoline. */
-  add x30, x30, #12
+  add x30, x30, 12
   SAVE_REGISTERS
 
   // Load the handler function pointer into x2.
@@ -83,7 +93,7 @@ ASM_SYMBOL(__xray_FunctionExit):
   cbz x2, 1f
   // Set w0 to the function ID (w17). Set x1 to XRayEntryType::EXIT = 1.
   mov w0, w17
-  mov x1, #1
+  mov x1, 1
   // Call the handler with 2 parameters.
   blr x2
 1:
@@ -96,12 +106,13 @@ ASM_SIZE(__xray_FunctionExit)
 ASM_HIDDEN(__xray_FunctionTailExit)
 ASM_TYPE_FUNCTION(__xray_FunctionTailExit)
 ASM_SYMBOL(__xray_FunctionTailExit):
+  BTI_C
     /* Move the return address beyond the end of sled data. The 12 bytes of
          data are inserted in the code of the runtime patch, between the call
          instruction and the instruction returned into. The data contains 32
          bits of instrumented function ID and 64 bits of the address of
          the current trampoline. */
-  add x30, x30, #12
+  add x30, x30, 12
   // Save the registers which may be modified by the handler function.
   SAVE_REGISTERS
   // Load the handler function pointer into x2.
@@ -109,7 +120,7 @@ ASM_SYMBOL(__xray_FunctionTailExit):
   cbz x2, 1f
   // Set w0 to the function ID (w17). Set x1 to XRayEntryType::TAIL = 2.
   mov w0, w17
-  mov x1, #2
+  mov x1, 2
   // Call the handler with 2 parameters.
   blr x2
 1:
@@ -122,7 +133,8 @@ ASM_SIZE(__xray_FunctionTailExit)
 ASM_HIDDEN(__xray_ArgLoggerEntry)
 ASM_TYPE_FUNCTION(__xray_ArgLoggerEntry)
 ASM_SYMBOL(__xray_ArgLoggerEntry):
-  add x30, x30, #12
+  BTI_C
+  add x30, x30, 12
   // Push the registers which may be modified by the handler function.
   SAVE_REGISTERS
 
@@ -135,7 +147,7 @@ ASM_SYMBOL(__xray_ArgLoggerEntry):
 
 2:
   mov x2, x0
-  mov x1, #3  // XRayEntryType::LOG_ARGS_ENTRY
+  mov x1, 3   // XRayEntryType::LOG_ARGS_ENTRY
   mov w0, w17
   blr x8
 
@@ -149,6 +161,7 @@ ASM_SIZE(__xray_ArgLoggerEntry)
 .global ASM_SYMBOL(__xray_CustomEvent)
 ASM_TYPE_FUNCTION(__xray_CustomEvent)
 ASM_SYMBOL(__xray_CustomEvent):
+  BTI_C
   SAVE_REGISTERS
   LOAD_HANDLER_ADDR x8, _ZN6__xray22XRayPatchedCustomEventE
   cbz x8, 1f
@@ -161,6 +174,7 @@ ASM_SIZE(__xray_CustomEvent)
 .global ASM_SYMBOL(__xray_TypedEvent)
 ASM_TYPE_FUNCTION(__xray_TypedEvent)
 ASM_SYMBOL(__xray_TypedEvent):
+  BTI_C
   SAVE_REGISTERS
   LOAD_HANDLER_ADDR x8, _ZN6__xray21XRayPatchedTypedEventE
   cbz x8, 1f

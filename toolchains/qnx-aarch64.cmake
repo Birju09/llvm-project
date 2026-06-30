@@ -103,7 +103,7 @@ set(_qnx_includes
 
 set(CMAKE_C_FLAGS_INIT   "${_qnx_defs} ${_qnx_includes}")
 set(CMAKE_CXX_FLAGS_INIT "${_qnx_defs} ${_qnx_includes}")
-set(CMAKE_ASM_FLAGS_INIT "")
+set(CMAKE_ASM_FLAGS_INIT "--target=${QNX_TARGET_TRIPLE}")
 
 # ---------------------------------------------------------------------------
 # Library search paths

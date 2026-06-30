@@ -1537,7 +1537,8 @@ void tools::linkSanitizerRuntimeDeps(const ToolChain &TC,
   addAsNeededOption(TC, Args, CmdArgs, false);
   // There's no libpthread or librt on RTEMS & Android.
   if (TC.getTriple().getOS() != llvm::Triple::RTEMS &&
-      !TC.getTriple().isAndroid() && !TC.getTriple().isOHOSFamily()) {
+      !TC.getTriple().isAndroid() && !TC.getTriple().isOHOSFamily() &&
+      !TC.getTriple().isOSQNX()) {
     CmdArgs.push_back("-lpthread");
     if (!TC.getTriple().isOSOpenBSD() && !TC.getTriple().isOSHaiku())
       CmdArgs.push_back("-lrt");
@@ -1546,7 +1547,7 @@ void tools::linkSanitizerRuntimeDeps(const ToolChain &TC,
   // There's no libdl on all OSes.
   if (!TC.getTriple().isOSFreeBSD() && !TC.getTriple().isOSNetBSD() &&
       !TC.getTriple().isOSOpenBSD() && !TC.getTriple().isOSDragonFly() &&
-      !TC.getTriple().isOSHaiku() &&
+      !TC.getTriple().isOSHaiku() && !TC.getTriple().isOSQNX() &&
       TC.getTriple().getOS() != llvm::Triple::RTEMS)
     CmdArgs.push_back("-ldl");
   // Required for backtrace on some OSes
@@ -1806,14 +1807,16 @@ void tools::linkXRayRuntimeDeps(const ToolChain &TC,
                                 const llvm::opt::ArgList &Args,
                                 ArgStringList &CmdArgs) {
   addAsNeededOption(TC, Args, CmdArgs, false);
-  CmdArgs.push_back("-lpthread");
-  if (!TC.getTriple().isOSOpenBSD())
+  if (!TC.getTriple().isOSQNX())
+    CmdArgs.push_back("-lpthread");
+  if (!TC.getTriple().isOSOpenBSD() && !TC.getTriple().isOSQNX())
     CmdArgs.push_back("-lrt");
   CmdArgs.push_back("-lm");
 
   if (!TC.getTriple().isOSFreeBSD() &&
       !TC.getTriple().isOSNetBSD() &&
-      !TC.getTriple().isOSOpenBSD())
+      !TC.getTriple().isOSOpenBSD() &&
+      !TC.getTriple().isOSQNX())
     CmdArgs.push_back("-ldl");
 }
 

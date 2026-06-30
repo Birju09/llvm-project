@@ -13,6 +13,7 @@
 #include "rtsan/rtsan_flags.h"
 #include "sanitizer_common/sanitizer_flag_parser.h"
 #include "sanitizer_common/sanitizer_flags.h"
+#include "sanitizer_common/sanitizer_platform.h"
 
 using namespace __sanitizer;
 using namespace __rtsan;
@@ -37,6 +38,14 @@ void __rtsan::InitializeFlags() {
     cf.CopyFrom(*common_flags());
     cf.exitcode = 43;
     cf.external_symbolizer_path = GetEnv("RTSAN_SYMBOLIZER_PATH");
+#if SANITIZER_QNX
+    // QNX's slow unwinder (_Unwind_Backtrace) uses signals internally, which
+    // deadlocks inside RTSAN's bypass context (sigwaitinfo never returns).
+    // Force the fast frame-pointer unwinder which is signal-free.
+    cf.fast_unwind_on_fatal = true;
+    cf.fast_unwind_on_check = true;
+    cf.fast_unwind_on_malloc = true;
+#endif
     OverrideCommonFlags(cf);
   }
 

@@ -28,7 +28,10 @@
 #include <zircon/syscalls.h>
 #endif
 
+extern "C" void __clear_cache(void *start, void *end);
+
 #include "sanitizer_common/sanitizer_addrhashmap.h"
+#include "sanitizer_common/sanitizer_allocator_internal.h"
 #include "sanitizer_common/sanitizer_common.h"
 
 #include "xray_defs.h"
@@ -114,8 +117,8 @@ public:
       : PageAlignedAddr(PageAlignedAddr),
         MProtectLen(MProtectLen),
         MustCleanup(false) {
-#if SANITIZER_FUCHSIA
-    MProtectLen = RoundUpTo(MProtectLen, PageSize);
+#if SANITIZER_FUCHSIA || SANITIZER_QNX
+    this->MProtectLen = RoundUpTo(MProtectLen, PageSize);
 #endif
   }
 
@@ -128,6 +131,75 @@ public:
              _zx_status_get_string(R));
       return -1;
     }
+    MustCleanup = true;
+    return 0;
+#elif SANITIZER_QNX
+    Report("XRay QNX: MakeWriteable addr=%p len=%zu (0x%zx)\n",
+           PageAlignedAddr, MProtectLen, MProtectLen);
+    Report("XRay QNX: range [%p, %p)\n",
+           PageAlignedAddr,
+           reinterpret_cast<char *>(PageAlignedAddr) + MProtectLen);
+    // Fast path: try mprotect(PROT_READ|PROT_WRITE|PROT_EXEC) directly.
+    if (mprotect(PageAlignedAddr, MProtectLen,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+      Report("XRay QNX: fast path (RWX) succeeded\n");
+      MustCleanup = true;
+      return 0;
+    }
+    Report("XRay QNX: fast path (RWX) failed errno=%d, trying slow path\n",
+           errno);
+    // Slow path: replace file-backed mapping with anonymous RW copy.
+#  ifndef MAP_ANON
+#    define MAP_ANON MAP_ANONYMOUS
+#  endif
+    Report("XRay QNX: slow path: saving %zu bytes from %p\n",
+           MProtectLen, PageAlignedAddr);
+    auto *Saved = reinterpret_cast<char *>(InternalAlloc(MProtectLen));
+    if (!Saved) {
+      Report("XRay QNX: InternalAlloc(%zu) failed\n", MProtectLen);
+      return -1;
+    }
+    internal_memcpy(Saved, PageAlignedAddr, MProtectLen);
+    // Verify save: check first and last 4 bytes are non-zero
+    {
+      uint32_t First, Last;
+      internal_memcpy(&First, Saved, sizeof(First));
+      internal_memcpy(&Last, Saved + MProtectLen - sizeof(Last), sizeof(Last));
+      Report("XRay QNX: saved first_insn=0x%08x last_insn=0x%08x\n",
+             First, Last);
+    }
+    void *R = mmap(PageAlignedAddr, MProtectLen, PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (R == MAP_FAILED) {
+      Report("XRay QNX: mmap(MAP_FIXED) failed errno=%d\n", errno);
+      InternalFree(Saved);
+      return -1;
+    }
+    Report("XRay QNX: mmap(MAP_FIXED) at %p returned %p, restoring...\n",
+           PageAlignedAddr, R);
+    internal_memcpy(PageAlignedAddr, Saved, MProtectLen);
+    InternalFree(Saved);
+    // Verify restore: check first and last 4 bytes
+    {
+      uint32_t First, Last;
+      internal_memcpy(&First, PageAlignedAddr, sizeof(First));
+      internal_memcpy(&Last,
+                      reinterpret_cast<char *>(PageAlignedAddr) +
+                          MProtectLen - sizeof(Last),
+                      sizeof(Last));
+      Report("XRay QNX: restored first_insn=0x%08x last_insn=0x%08x\n",
+             First, Last);
+    }
+    // AArch64 has non-coherent icache/dcache. The mmap zeroed the pages
+    // (potentially caching zeros in icache), and memcpy restored content
+    // via dcache only. We must invalidate the icache for the entire range
+    // so the CPU fetches the restored instructions, not stale zeros.
+    Report("XRay QNX: calling __clear_cache(%p, %p)\n",
+           PageAlignedAddr,
+           reinterpret_cast<char *>(PageAlignedAddr) + MProtectLen);
+    __clear_cache(reinterpret_cast<char *>(PageAlignedAddr),
+                  reinterpret_cast<char *>(PageAlignedAddr) + MProtectLen);
+    Report("XRay QNX: slow path complete, pages are RW\n");
     MustCleanup = true;
     return 0;
 #else
@@ -149,7 +221,33 @@ public:
                _zx_status_get_string(R));
       }
 #else
-      mprotect(PageAlignedAddr, MProtectLen, PROT_READ | PROT_EXEC);
+      // Verify content is non-zero before making executable
+#  if SANITIZER_QNX
+      {
+        uint32_t First, Last;
+        internal_memcpy(&First, PageAlignedAddr, sizeof(First));
+        internal_memcpy(&Last,
+                        reinterpret_cast<char *>(PageAlignedAddr) +
+                            MProtectLen - sizeof(Last),
+                        sizeof(Last));
+        Report("XRay QNX: ~MProtectHelper before mprotect(R|X): "
+               "addr=%p len=%zu (0x%zx) range=[%p, %p) "
+               "first_insn=0x%08x last_insn=0x%08x\n",
+               PageAlignedAddr, MProtectLen, MProtectLen,
+               PageAlignedAddr,
+               reinterpret_cast<char *>(PageAlignedAddr) + MProtectLen,
+               First, Last);
+      }
+#  endif
+      int MpRet = mprotect(PageAlignedAddr, MProtectLen, PROT_READ | PROT_EXEC);
+#  if SANITIZER_QNX
+      Report("XRay QNX: ~MProtectHelper mprotect(R|X) ret=%d errno=%d\n",
+             MpRet, errno);
+#  endif
+      if (MpRet != 0) {
+        Report("XRay: mprotect(PROT_READ|PROT_EXEC) failed (errno=%d).\n",
+               errno);
+      }
 #endif
     }
   }

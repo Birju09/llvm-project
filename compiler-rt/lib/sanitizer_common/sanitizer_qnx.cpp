@@ -22,21 +22,36 @@
 #  include "sanitizer_mutex.h"
 #  include "sanitizer_procmaps.h"
 
+#  include <devctl.h>
 #  include <dlfcn.h>
 #  include <errno.h>
 #  include <fcntl.h>
 #  include <pthread.h>
 #  include <sched.h>
 #  include <signal.h>
+#  include <sys/elf.h>
+#  include <sys/link.h>
 #  include <sys/mman.h>
 #  include <sys/neutrino.h>
+#  include <sys/procfs.h>
 #  include <sys/resource.h>
 #  include <sys/stat.h>
 #  include <sys/time.h>
 #  include <sys/types.h>
 #  include <sys/wait.h>
 #  include <ucontext.h>
+#  include <stdio.h>
 #  include <unistd.h>
+
+// QNX doesn't have MAP_NORESERVE
+#  ifndef MAP_NORESERVE
+#    define MAP_NORESERVE 0
+#  endif
+
+// QNX doesn't have MADV_DONTNEED; use POSIX equivalent
+#  ifndef MADV_DONTNEED
+#    define MADV_DONTNEED POSIX_MADV_DONTNEED
+#  endif
 
 // QNX may define MAP_ANON but not MAP_ANONYMOUS
 #  ifndef MAP_ANONYMOUS
@@ -47,17 +62,76 @@
 
 namespace __sanitizer {
 
+// Fallback __cxa_guard_* for when the C++ runtime isn't linked in.
+// Uses GCC/Clang atomic builtins so these are thread-safe.
+// Byte layout: 0 = uninitialized, 1 = in-progress, 2 = done.
+extern "C" SANITIZER_WEAK_ATTRIBUTE int __cxa_guard_acquire(void *guard_object) {
+  unsigned char *guard = static_cast<unsigned char *>(guard_object);
+  if (__atomic_load_n(guard, __ATOMIC_ACQUIRE) == 2)
+    return 0;  // Already initialized.
+  unsigned char expected = 0;
+  if (!__atomic_compare_exchange_n(guard, &expected, (unsigned char)1,
+                                   /*weak=*/false, __ATOMIC_ACQ_REL,
+                                   __ATOMIC_ACQUIRE))
+    return 0;  // Another thread claimed initialization or it's already done.
+  return 1;
+}
+
+extern "C" SANITIZER_WEAK_ATTRIBUTE void __cxa_guard_release(void *guard_object) {
+  unsigned char *guard = static_cast<unsigned char *>(guard_object);
+  __atomic_store_n(guard, (unsigned char)2, __ATOMIC_RELEASE);
+}
+
+extern "C" SANITIZER_WEAK_ATTRIBUTE void __cxa_guard_abort(void *guard_object) {
+  unsigned char *guard = static_cast<unsigned char *>(guard_object);
+  __atomic_store_n(guard, (unsigned char)0, __ATOMIC_RELEASE);
+}
+
 // --------------- sanitizer_libc.h
+
+// Cache the real mmap from libc so that internal_mmap bypasses any PLT
+// interceptors (e.g. RTSAN's mmap interceptor). This mirrors how Linux uses
+// internal_syscall() to avoid going through the PLT for sanitizer-internal
+// memory allocations.
+//
+// We use atomics instead of pthread_once to avoid calling intercepted pthread
+// functions during early init. A thread-local re-entrancy guard prevents
+// infinite recursion if dlsym itself calls mmap internally during init.
+typedef void *(*MmapFn)(void *, size_t, int, int, int, off_t);
+static MmapFn real_mmap_fn = nullptr;
+static int real_mmap_init_done = 0; // 0=uninitialized, 1=done
+static __thread bool real_mmap_initializing = false;
+
+static MmapFn GetRealMmap() {
+  if (__atomic_load_n(&real_mmap_init_done, __ATOMIC_ACQUIRE))
+    return real_mmap_fn;
+  // Re-entrancy: if dlsym calls mmap internally, use PLT (returns nullptr
+  // here so caller falls back to PLT mmap).
+  if (real_mmap_initializing)
+    return nullptr;
+  real_mmap_initializing = true;
+  MmapFn fn = (MmapFn)dlsym(RTLD_NEXT, "mmap");
+  if (!fn)
+    fn = (MmapFn)dlsym(RTLD_DEFAULT, "mmap");
+  real_mmap_fn = fn;
+  __atomic_store_n(&real_mmap_init_done, 1, __ATOMIC_RELEASE);
+  real_mmap_initializing = false;
+  return fn;
+}
 
 uptr internal_mmap(void *addr, uptr length, int prot, int flags, int fd,
                    u64 offset) {
-  // MAP_ANONYMOUS requires fd=-1 on QNX
+  // MAP_ANONYMOUS requires fd=-1 on QNX.
   if (flags & MAP_ANONYMOUS)
     fd = -1;
-  uptr res = (uptr)mmap(addr, length, prot, flags, fd, (off_t)offset);
-  if (res == (uptr)MAP_FAILED)
+  // Call the real libc mmap directly, bypassing any PLT interceptors.
+  // Falls back to PLT mmap only during re-entrant dlsym init.
+  MmapFn fn = GetRealMmap();
+  void *res = fn ? fn(addr, length, prot, flags, fd, (off_t)offset)
+                 : mmap(addr, length, prot, flags, fd, (off_t)offset);
+  if (res == MAP_FAILED)
     return (uptr)-errno;
-  return res;
+  return (uptr)res;
 }
 
 uptr internal_munmap(void *addr, uptr length) {
@@ -69,9 +143,10 @@ uptr internal_munmap(void *addr, uptr length) {
 
 uptr internal_mremap(void *old_address, uptr old_size, uptr new_size, int flags,
                      void *new_address) {
-  // QNX does not support mremap.
-  CHECK(false && "internal_mremap is not supported on QNX");
-  return (uptr)-ENOSYS;
+  // QNX does not support mremap. Callers must avoid this path or use
+  // munmap+mmap instead.
+  errno = ENOSYS;
+  return (uptr)-1;
 }
 
 int internal_mprotect(void *addr, uptr length, int prot) {
@@ -79,7 +154,9 @@ int internal_mprotect(void *addr, uptr length, int prot) {
 }
 
 int internal_madvise(uptr addr, uptr length, int advice) {
-  return madvise((void *)addr, length, advice);
+  // QNX doesn't have madvise; posix_madvise is available but returns
+  // error code directly (not via errno).
+  return posix_madvise((void *)addr, length, advice);
 }
 
 uptr internal_close(fd_t fd) {
@@ -184,7 +261,7 @@ uptr internal_unlink(const char *path) {
 }
 
 uptr internal_rename(const char *oldpath, const char *newpath) {
-  int res = rename(oldpath, newpath);
+  int res = ::rename(oldpath, newpath);
   if (res == -1)
     return (uptr)-errno;
   return 0;
@@ -206,7 +283,7 @@ void internal_usleep(u64 useconds) {
 
 uptr internal_execve(const char *filename, char *const argv[],
                      char *const envp[]) {
-  int res = execve(filename, argv, envp);
+  execve(filename, argv, envp);
   return (uptr)-errno;
 }
 
@@ -215,9 +292,10 @@ void internal__exit(int exitcode) {
   Die();  // Unreachable.
 }
 
-// Ptrace is not available on QNX — devctl/procfs are used instead.
+// ptrace is not available on QNX; devctl/procfs are used for process control.
 uptr internal_ptrace(int request, int pid, void *addr, void *data) {
-  UNIMPLEMENTED();
+  errno = ENOSYS;
+  return (uptr)-1;
 }
 
 uptr internal_waitpid(int pid, int *status, int options) {
@@ -232,7 +310,9 @@ uptr internal_getpid() { return (uptr)getpid(); }
 uptr internal_getppid() { return (uptr)getppid(); }
 
 int internal_dlinfo(void *handle, int request, void *p) {
-  return dlinfo(handle, request, p);
+  // QNX does not provide dlinfo(); this interface is unsupported.
+  errno = ENOSYS;
+  return -1;
 }
 
 uptr internal_lseek(fd_t fd, OFF_T offset, int whence) {
@@ -243,8 +323,9 @@ uptr internal_lseek(fd_t fd, OFF_T offset, int whence) {
 }
 
 uptr internal_prctl(int option, uptr arg2, uptr arg3, uptr arg4, uptr arg5) {
-  // prctl is not available on QNX.
-  UNIMPLEMENTED();
+  // prctl is a Linux-specific syscall not available on QNX.
+  errno = ENOSYS;
+  return (uptr)-1;
 }
 
 uptr internal_sigaltstack(const void *ss, void *oss) {
@@ -295,30 +376,135 @@ u64 NanoTime() {
   return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
 }
 
-// ThreadLister: QNX enumerates threads via /proc/<pid>/as + devctl.
-// Provide a minimal stub that returns the current thread only.
-// Full implementation is in sanitizer_procmaps_qnx.cpp.
+// ThreadLister: enumerate threads via /proc/<pid>/as + DCMD_PROC_TIDSTATUS.
 ThreadLister::ThreadLister(pid_t pid) : buffer_(4096) {
-  task_path_.AppendF("/proc/%d", pid);
+  task_path_.AppendF("/proc/%d/as", pid);
 }
 
 ThreadLister::Result ThreadLister::ListThreads(
     InternalMmapVector<ThreadID> *threads) {
-  // QNX thread enumeration via /proc/<pid>/as + devctl(DCMD_PROC_TIDSTATUS)
-  // For now, return just the current thread as a fallback.
   threads->clear();
-  threads->push_back((ThreadID)gettid());
+
+  int fd = open(task_path_.data(), O_RDONLY | O_NONBLOCK);
+  if (fd < 0) {
+    // Fallback: at minimum return the current thread.
+    threads->push_back((ThreadID)gettid());
+    return Ok;
+  }
+
+  // Get process info to know how many threads exist.
+  // Heap-allocate large procfs structs to keep the stack frame small.
+  InternalMmapVector<procfs_info> pinfo_buf(1);
+  procfs_info *pinfo = pinfo_buf.data();
+  internal_memset(pinfo, 0, sizeof(*pinfo));
+  if (devctl(fd, DCMD_PROC_INFO, pinfo, sizeof(*pinfo), nullptr) != EOK) {
+    close(fd);
+    threads->push_back((ThreadID)gettid());
+    return Ok;
+  }
+
+  // TIDs on QNX start at 1 and are assigned sequentially. Iterate until
+  // devctl returns an error or we've found all live threads.
+  // Use num_threads * 4 as an upper bound to handle TID gaps from thread
+  // creation/destruction.
+  const int max_tid = pinfo->num_threads * 4 + 16;
+  InternalMmapVector<procfs_status> status_buf(1);
+  procfs_status *status = status_buf.data();
+  for (int tid = 1; tid <= max_tid; ++tid) {
+    internal_memset(status, 0, sizeof(*status));
+    status->tid = tid;
+    if (devctl(fd, DCMD_PROC_TIDSTATUS, status, sizeof(*status), nullptr) !=
+        EOK)
+      continue;
+    if (status->state != STATE_DEAD)
+      threads->push_back((ThreadID)status->tid);
+  }
+
+  close(fd);
+
+  if (threads->empty())
+    threads->push_back((ThreadID)gettid());
+
   return Ok;
 }
 
-const char *ThreadLister::LoadStatus(ThreadID tid) {
-  return nullptr;
-}
+const char *ThreadLister::LoadStatus(ThreadID tid) { return nullptr; }
 
 bool ThreadLister::IsAlive(ThreadID tid) {
-  // Check if the thread exists by sending signal 0.
-  return tgkill(getpid(), (int)tid, 0) == 0;
+  return SignalKill(ND_LOCAL_NODE, getpid(), (int)tid, 0, SI_USER, 0) == 0;
 }
+
+// Module listing via dl_iterate_phdr. QNX's callback takes const dl_phdr_info*.
+static int AddQNXModuleSegments(
+    const char *module_name, const dl_phdr_info *info,
+    InternalMmapVectorNoCtor<LoadedModule> *modules) {
+  // Use a placeholder name rather than skipping unknown modules entirely,
+  // so that modules_.size() > 0 is satisfied and address ranges are tracked.
+  const char *name =
+      (module_name && module_name[0]) ? module_name : "<unknown>";
+  LoadedModule cur_module;
+  cur_module.set(name, info->dlpi_addr);
+  if (!info->dlpi_phdr || info->dlpi_phnum == 0) {
+    modules->push_back(cur_module);
+    return 0;
+  }
+  for (int i = 0; i < (int)info->dlpi_phnum; ++i) {
+    const Elf64_Phdr *phdr = &info->dlpi_phdr[i];
+    if (phdr->p_type == PT_LOAD) {
+      uptr cur_beg = info->dlpi_addr + phdr->p_vaddr;
+      uptr cur_end = cur_beg + phdr->p_memsz;
+      bool executable = (phdr->p_flags & PF_X) != 0;
+      bool writable = (phdr->p_flags & PF_W) != 0;
+      cur_module.addAddressRange(cur_beg, cur_end, executable, writable);
+    }
+  }
+  modules->push_back(cur_module);
+  return 0;
+}
+
+struct QNXDlIteratePhdrData {
+  InternalMmapVectorNoCtor<LoadedModule> *modules;
+  bool first;
+};
+
+static int QNXDlIteratePhdrCb(const dl_phdr_info *info, size_t size,
+                               void *arg) {
+  QNXDlIteratePhdrData *data = static_cast<QNXDlIteratePhdrData *>(arg);
+  if (data->first) {
+    // First entry is the main executable; dlpi_name may be empty.
+    data->first = false;
+    InternalMmapVector<char> module_name(kMaxPathLength);
+    ReadBinaryNameCached(module_name.data(), module_name.size());
+    const char *name =
+        (info->dlpi_name && info->dlpi_name[0]) ? info->dlpi_name
+                                                 : module_name.data();
+    return AddQNXModuleSegments(name, info, data->modules);
+  }
+  // Don't skip modules with empty names — use placeholder so they're tracked.
+  const char *name =
+      (info->dlpi_name && info->dlpi_name[0]) ? info->dlpi_name : "<unknown>";
+  return AddQNXModuleSegments(name, info, data->modules);
+}
+
+void ListOfModules::init() {
+  clearOrInit();
+  QNXDlIteratePhdrData data = {&modules_, true};
+  dl_iterate_phdr(QNXDlIteratePhdrCb, &data);
+
+  // Fallback: if dl_iterate_phdr didn't enumerate any modules (e.g. static
+  // build or unimplemented on this QNX configuration), synthesize an entry
+  // for the executable itself so RAW_CHECK(modules_.size() > 0) doesn't fire.
+  if (modules_.size() == 0) {
+    InternalMmapVector<char> exe_name(kMaxPathLength);
+    ReadBinaryNameCached(exe_name.data(), exe_name.size());
+    const char *name = exe_name.data()[0] ? exe_name.data() : "<unknown>";
+    LoadedModule exe_module;
+    exe_module.set(name, /*base_address=*/0);
+    modules_.push_back(exe_module);
+  }
+}
+
+void ListOfModules::fallbackInit() { clear(); }
 
 }  // namespace __sanitizer
 

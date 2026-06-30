@@ -14,7 +14,7 @@
 #include "interception.h"
 
 #if SANITIZER_LINUX || SANITIZER_FREEBSD || SANITIZER_NETBSD || \
-    SANITIZER_SOLARIS || SANITIZER_HAIKU
+    SANITIZER_SOLARIS || SANITIZER_HAIKU || SANITIZER_QNX
 
 #include <dlfcn.h>   // for dlsym() and dlvsym()
 

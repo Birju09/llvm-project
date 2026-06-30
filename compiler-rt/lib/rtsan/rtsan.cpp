@@ -96,7 +96,8 @@ SANITIZER_INTERFACE_ATTRIBUTE void __rtsan_init() {
   SetInitializationState(InitializationState::Initialized);
 }
 
-SANITIZER_INTERFACE_ATTRIBUTE void __rtsan_ensure_initialized() {
+SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE void
+__rtsan_ensure_initialized() {
   if (LIKELY(__rtsan_is_initialized()))
     return;
 

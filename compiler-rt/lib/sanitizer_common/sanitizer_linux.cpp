@@ -58,7 +58,11 @@
 #  include <dlfcn.h>
 #  include <errno.h>
 #  include <fcntl.h>
-#  include <link.h>
+#  if SANITIZER_QNX
+#    include <sys/link.h>
+#  else
+#    include <link.h>
+#  endif
 #  include <pthread.h>
 #  include <sched.h>
 #  include <signal.h>
@@ -690,7 +694,7 @@ u64 NanoTime() {
 uptr internal_clock_gettime(__sanitizer_clockid_t clk_id, void *tp) {
   return internal_syscall(SYSCALL(clock_gettime), clk_id, tp);
 }
-#  elif !SANITIZER_SOLARIS && !SANITIZER_NETBSD
+#  elif !SANITIZER_SOLARIS && !SANITIZER_NETBSD && !SANITIZER_QNX
 u64 NanoTime() {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
@@ -775,7 +779,14 @@ static void ReadNullSepFileToArray(const char *path, char ***arr,
 #  endif
 
 static void GetArgsAndEnv(char ***argv, char ***envp) {
-#  if SANITIZER_HAIKU
+#  if SANITIZER_QNX
+  // QNX: use C runtime globals directly; avoids /proc/self/cmdline which can
+  // block or fail to support dup() causing infinite loops in ReserveStandardFds.
+  // environ is declared extern at file scope below.
+  // argv is not critical (only used for program name in reports).
+  *argv = nullptr;
+  *envp = ::environ;
+#  elif SANITIZER_HAIKU
   *argv = __libc_argv;
   *envp = environ;
 #  elif SANITIZER_FREEBSD
@@ -837,7 +848,7 @@ char **GetEnviron() {
 void FutexWait(atomic_uint32_t *p, u32 cmp) {
 #    if SANITIZER_FREEBSD
   _umtx_op(p, UMTX_OP_WAIT_UINT, cmp, 0, 0);
-#    elif SANITIZER_NETBSD || SANITIZER_HAIKU
+#    elif SANITIZER_NETBSD || SANITIZER_HAIKU || SANITIZER_QNX
   sched_yield(); /* No userspace futex-like synchronization */
 #    else
   internal_syscall(SYSCALL(futex), (uptr)p, FUTEX_WAIT_PRIVATE, cmp, 0, 0, 0);
@@ -847,7 +858,7 @@ void FutexWait(atomic_uint32_t *p, u32 cmp) {
 void FutexWake(atomic_uint32_t *p, u32 count) {
 #    if SANITIZER_FREEBSD
   _umtx_op(p, UMTX_OP_WAKE, count, 0, 0);
-#    elif SANITIZER_NETBSD || SANITIZER_HAIKU
+#    elif SANITIZER_NETBSD || SANITIZER_HAIKU || SANITIZER_QNX
   /* No userspace futex-like synchronization */
 #    else
   internal_syscall(SYSCALL(futex), (uptr)p, FUTEX_WAKE_PRIVATE, count, 0, 0, 0);
@@ -1376,7 +1387,7 @@ bool LibraryNameIs(const char *full_name, const char *base_name) {
   return (name[base_name_length] == '-' || name[base_name_length] == '.');
 }
 
-#  if !SANITIZER_ANDROID && !SANITIZER_HAIKU
+#  if !SANITIZER_ANDROID && !SANITIZER_HAIKU && !SANITIZER_QNX
 // Call cb for each region mapped by map.
 void ForEachMappedRegion(link_map *map, void (*cb)(const void *, uptr)) {
   CHECK_NE(map, nullptr);
@@ -1979,6 +1990,12 @@ static bool Aarch64GetESR(ucontext_t *ucontext, u64 *esr) {
     }
     aux += ctx->size;
   }
+  return false;
+}
+#  elif SANITIZER_QNX && defined(__aarch64__)
+static bool Aarch64GetESR(ucontext_t *ucontext, u64 *esr) {
+  (void)ucontext;
+  (void)esr;
   return false;
 }
 #  elif SANITIZER_FREEBSD && defined(__aarch64__)
@@ -2594,6 +2611,14 @@ static void GetPcSpBp(void *context, uptr *pc, uptr *sp, uptr *bp) {
   *pc = ucontext->uc_mcontext.mc_gpregs.gp_elr;
   *bp = ucontext->uc_mcontext.mc_gpregs.gp_x[29];
   *sp = ucontext->uc_mcontext.mc_gpregs.gp_sp;
+#    elif SANITIZER_QNX
+  // QNX AArch64: mcontext_t is __aarch64_mcontext with a nested `cpu` field
+  // of type AARCH64_CPU_REGISTERS. ELR is cpu.elr; GPRs are cpu.gpr[0..31];
+  // SP is cpu.gpr[31] (AARCH64_REG_SP), not a separate field.
+  ucontext_t *ucontext = (ucontext_t *)context;
+  *pc = ucontext->uc_mcontext.cpu.elr;
+  *bp = ucontext->uc_mcontext.cpu.gpr[29];
+  *sp = ucontext->uc_mcontext.cpu.gpr[31];
 #    else
   ucontext_t *ucontext = (ucontext_t *)context;
   *pc = ucontext->uc_mcontext.pc;
