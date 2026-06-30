@@ -17,7 +17,8 @@
 #include <pthread.h>
 
 using namespace __sanitizer;
-using namespace __rtsan;
+
+namespace __rtsan {
 
 static pthread_key_t context_key;
 static pthread_once_t key_once = PTHREAD_ONCE_INIT;
@@ -26,7 +27,36 @@ static pthread_once_t key_once = PTHREAD_ONCE_INIT;
 // because it expects a signature with only one arg
 static void InternalFreeWrapper(void *ptr) { __sanitizer::InternalFree(ptr); }
 
-static __rtsan::Context &GetContextForThisThreadImpl() {
+// Re-entrancy guard: set to true while this thread is initializing its
+// per-thread context. Accessed via raw TLS (not pthread_getspecific), so it
+// does NOT trigger RTSAN interceptors, breaking the initialization cycle.
+//
+// Initialization cycle on QNX (and some other platforms):
+//   GetContextForThisThread()
+//     -> pthread_once() / pthread_key_create()  [intercepted]
+//       -> interceptor calls GetContextForThisThread()
+//         -> pthread_once() again -> deadlock / infinite recursion
+//
+// When re-entrancy is detected we return a static fallback context that is
+// never in realtime mode, so the intercepted init calls are silently allowed.
+static __thread bool g_initializing_context = false;
+
+// Constructor defined before the static instance so it is available.
+Context::Context() = default;
+
+// Fallback context returned during re-entrant initialization. It is never
+// in realtime mode and never bypassed, so intercepted calls during init pass
+// through without triggering violations.
+static Context g_init_fallback_context;
+
+static Context &GetContextForThisThreadImpl() {
+  // Fast re-entrancy check: if we are already setting up the context for this
+  // thread, return the fallback to avoid infinite recursion.
+  if (g_initializing_context)
+    return g_init_fallback_context;
+
+  g_initializing_context = true;
+
   auto MakeThreadLocalContextKey = []() {
     CHECK_EQ(pthread_key_create(&context_key, InternalFreeWrapper), 0);
   };
@@ -41,23 +71,22 @@ static __rtsan::Context &GetContextForThisThreadImpl() {
     pthread_setspecific(context_key, current_thread_context);
   }
 
+  g_initializing_context = false;
   return *current_thread_context;
 }
 
-__rtsan::Context::Context() = default;
+void Context::RealtimePush() { realtime_depth_++; }
 
-void __rtsan::Context::RealtimePush() { realtime_depth_++; }
+void Context::RealtimePop() { realtime_depth_--; }
 
-void __rtsan::Context::RealtimePop() { realtime_depth_--; }
+void Context::BypassPush() { bypass_depth_++; }
 
-void __rtsan::Context::BypassPush() { bypass_depth_++; }
+void Context::BypassPop() { bypass_depth_--; }
 
-void __rtsan::Context::BypassPop() { bypass_depth_--; }
+bool Context::InRealtimeContext() const { return realtime_depth_ > 0; }
 
-bool __rtsan::Context::InRealtimeContext() const { return realtime_depth_ > 0; }
+bool Context::IsBypassed() const { return bypass_depth_ > 0; }
 
-bool __rtsan::Context::IsBypassed() const { return bypass_depth_ > 0; }
+Context &GetContextForThisThread() { return GetContextForThisThreadImpl(); }
 
-Context &__rtsan::GetContextForThisThread() {
-  return GetContextForThisThreadImpl();
-}
+} // namespace __rtsan

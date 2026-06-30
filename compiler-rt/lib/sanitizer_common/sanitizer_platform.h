@@ -15,7 +15,7 @@
 #if !defined(__linux__) && !defined(__FreeBSD__) && !defined(__NetBSD__) && \
     !defined(__APPLE__) && !defined(_WIN32) && !defined(__Fuchsia__) &&     \
     !(defined(__sun__) && defined(__svr4__)) && !defined(__HAIKU__) &&      \
-    !defined(__wasi__)
+    !defined(__wasi__) && !defined(__QNXNTO__)
 #  error "This operating system is not supported"
 #endif
 
@@ -66,6 +66,12 @@
 #  define SANITIZER_WASI 1
 #else
 #  define SANITIZER_WASI 0
+#endif
+
+#if defined(__QNXNTO__)
+#  define SANITIZER_QNX 1
+#else
+#  define SANITIZER_QNX 0
 #endif
 
 // - SANITIZER_APPLE: all Apple code
@@ -151,7 +157,7 @@
 
 #define SANITIZER_POSIX                                       \
   (SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_APPLE || \
-   SANITIZER_NETBSD || SANITIZER_SOLARIS || SANITIZER_HAIKU)
+   SANITIZER_NETBSD || SANITIZER_SOLARIS || SANITIZER_HAIKU || SANITIZER_QNX)
 
 #if __LP64__ || defined(_WIN64)
 #  define SANITIZER_WORDSIZE 64

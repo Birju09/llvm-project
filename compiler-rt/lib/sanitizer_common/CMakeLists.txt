@@ -16,6 +16,7 @@ set(SANITIZER_SOURCES_NOTERMINATION
   sanitizer_libignore.cpp
   sanitizer_linux.cpp
   sanitizer_linux_s390.cpp
+  sanitizer_qnx.cpp
   sanitizer_mac.cpp
   sanitizer_mutex.cpp
   sanitizer_netbsd.cpp
@@ -23,6 +24,7 @@ set(SANITIZER_SOURCES_NOTERMINATION
   sanitizer_platform_limits_linux.cpp
   sanitizer_platform_limits_netbsd.cpp
   sanitizer_platform_limits_posix.cpp
+  sanitizer_platform_limits_qnx.cpp
   sanitizer_platform_limits_solaris.cpp
   sanitizer_posix.cpp
   sanitizer_printf.cpp
@@ -32,6 +34,7 @@ set(SANITIZER_SOURCES_NOTERMINATION
   sanitizer_procmaps_haiku.cpp
   sanitizer_procmaps_linux.cpp
   sanitizer_procmaps_mac.cpp
+  sanitizer_procmaps_qnx.cpp
   sanitizer_procmaps_solaris.cpp
   sanitizer_range.cpp
   sanitizer_solaris.cpp

@@ -228,7 +228,9 @@ SanitizerMask clang::driver::toolchains::QNX::getSupportedSanitizers() const {
   Res |= SanitizerKind::Memory;
   Res |= SanitizerKind::Leak;
   Res |= SanitizerKind::Thread;
-  return {};
+  Res |= SanitizerKind::Undefined;
+  Res |= SanitizerKind::Realtime;
+  return Res;
 }
 
 Tool *clang::driver::toolchains::QNX::buildLinker() const {

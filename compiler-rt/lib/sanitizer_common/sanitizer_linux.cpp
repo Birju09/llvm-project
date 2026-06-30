@@ -14,7 +14,7 @@
 #include "sanitizer_platform.h"
 
 #if SANITIZER_FREEBSD || SANITIZER_LINUX || SANITIZER_NETBSD || \
-    SANITIZER_SOLARIS || SANITIZER_HAIKU
+    SANITIZER_SOLARIS || SANITIZER_HAIKU || SANITIZER_QNX
 
 #  include "sanitizer_common.h"
 #  include "sanitizer_flags.h"
@@ -63,13 +63,18 @@
 #  include <sched.h>
 #  include <signal.h>
 #  include <sys/mman.h>
-#  if !SANITIZER_SOLARIS && !SANITIZER_HAIKU
+#  if !SANITIZER_SOLARIS && !SANITIZER_HAIKU && !SANITIZER_QNX
 #    include <sys/ptrace.h>
 #  endif
 #  include <sys/resource.h>
 #  include <sys/stat.h>
-#  if !SANITIZER_HAIKU
+#  if !SANITIZER_HAIKU && !SANITIZER_QNX
 #    include <sys/syscall.h>
+#    include <ucontext.h>
+#  endif
+#  if SANITIZER_QNX
+#    include <sys/neutrino.h>
+#    include <sys/types.h>
 #    include <ucontext.h>
 #  endif
 #  include <sys/time.h>
@@ -261,7 +266,8 @@ ScopedBlockSignals::~ScopedBlockSignals() { SetSigProcMask(&saved_, nullptr); }
 #  endif
 
 // --------------- sanitizer_libc.h
-#  if !SANITIZER_SOLARIS && !SANITIZER_NETBSD && !SANITIZER_HAIKU
+#  if !SANITIZER_SOLARIS && !SANITIZER_NETBSD && !SANITIZER_HAIKU && \
+      !SANITIZER_QNX
 #    if !SANITIZER_S390
 uptr internal_mmap(void *addr, uptr length, int prot, int flags, int fd,
                    u64 offset) {
@@ -608,7 +614,7 @@ uptr internal_execve(const char *filename, char *const argv[],
 }
 #  endif  // !SANITIZER_SOLARIS && !SANITIZER_NETBSD && !SANITIZER_HAIKU
 
-#  if !SANITIZER_NETBSD && !SANITIZER_HAIKU
+#  if !SANITIZER_NETBSD && !SANITIZER_HAIKU && !SANITIZER_QNX
 void internal__exit(int exitcode) {
 #    if SANITIZER_FREEBSD || SANITIZER_SOLARIS
   internal_syscall(SYSCALL(exit), exitcode);
@@ -647,6 +653,8 @@ ThreadID GetTid() {
   return thr_self();
 #    elif SANITIZER_HAIKU
   return find_thread(NULL);
+#    elif SANITIZER_QNX
+  return (ThreadID)gettid();
 #    else
   return internal_syscall(SYSCALL(gettid));
 #    endif
@@ -664,6 +672,9 @@ int TgKill(pid_t pid, ThreadID tid, int sig) {
   return errno != 0 ? -1 : 0;
 #    elif SANITIZER_HAIKU
   return kill_thread(tid);
+#    elif SANITIZER_QNX
+  // QNX uses SignalKill for targeted thread signals.
+  return SignalKill(ND_LOCAL_NODE, pid, tid, sig, SI_USER, 0);
 #    endif
 }
 #  endif
@@ -692,7 +703,7 @@ u64 NanoTime() {
 // should be called first inside __asan_init.
 const char *GetEnv(const char *name) {
 #  if SANITIZER_FREEBSD || SANITIZER_NETBSD || SANITIZER_SOLARIS || \
-      SANITIZER_HAIKU
+      SANITIZER_HAIKU || SANITIZER_QNX
   if (::environ != 0) {
     uptr NameLen = internal_strlen(name);
     for (char **Env = ::environ; *Env != 0; Env++) {
@@ -868,7 +879,8 @@ struct linux_dirent {
 };
 #  endif
 
-#  if !SANITIZER_SOLARIS && !SANITIZER_NETBSD && !SANITIZER_HAIKU
+#  if !SANITIZER_SOLARIS && !SANITIZER_NETBSD && !SANITIZER_HAIKU && \
+      !SANITIZER_QNX
 // Syscall wrappers.
 uptr internal_ptrace(int request, int pid, void *addr, void *data) {
   return internal_syscall(SYSCALL(ptrace), request, pid, (uptr)addr,
@@ -1082,7 +1094,7 @@ bool internal_sigismember(__sanitizer_sigset_t *set, int signum) {
 #    endif
 #  endif  // !SANITIZER_SOLARIS
 
-#  if !SANITIZER_NETBSD && !SANITIZER_HAIKU
+#  if !SANITIZER_NETBSD && !SANITIZER_HAIKU && !SANITIZER_QNX
 // ThreadLister implementation.
 ThreadLister::ThreadLister(pid_t pid) : buffer_(4096) {
   task_path_.AppendF("/proc/%d/task", pid);
