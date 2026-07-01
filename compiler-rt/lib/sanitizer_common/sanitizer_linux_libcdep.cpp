@@ -194,15 +194,14 @@ void GetThreadStackTopAndBottom(bool at_initialization, uptr *stack_top,
 #  else   // !SANITIZER_SOLARIS
 #    if SANITIZER_QNX
   {
-    // QNX supports pthread_attr_get_np to query thread attributes
-    // (similar to FreeBSD's pthread_attr_get_np / Linux's pthread_getattr_np).
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    if (pthread_attr_get_np(pthread_self(), &attr) == 0) {
-      internal_pthread_attr_getstack(&attr, &stackaddr, &stacksize);
-    }
-    pthread_attr_destroy(&attr);
-    if (stacksize == 0) {
+    // QNX lacks pthread_getattr_np/pthread_attr_get_np.
+    // Use pthread_stackseg_np to get the current thread's stack info.
+    stack_t ss;
+    if (pthread_stackseg_np(pthread_self(), &ss) == 0) {
+      // ss.ss_sp is the top of the stack, ss.ss_size is the size.
+      stacksize = ss.ss_size;
+      stackaddr = (char *)ss.ss_sp - stacksize;
+    } else {
       // Fallback: estimate from RLIMIT_STACK and current SP.
       volatile uptr stack_var = 0;
       uptr cur_sp = (uptr)&stack_var;
