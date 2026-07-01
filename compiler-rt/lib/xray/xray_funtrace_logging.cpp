@@ -176,8 +176,10 @@ static void funtraceHandleArg0(int32_t FuncId,
 // XRay log interface implementation.
 
 static void funtraceAtExit() XRAY_NEVER_INSTRUMENT {
+  Report("XRay Funtrace: atexit handler called, flushing trace data...\n");
   __xray_log_finalize();
-  __xray_log_flushLog();
+  auto FlushResult = __xray_log_flushLog();
+  Report("XRay Funtrace: flush result = %d\n", static_cast<int>(FlushResult));
 }
 
 static XRayLogInitStatus
@@ -191,6 +193,8 @@ funtraceLoggingInit(size_t, size_t, void *, size_t) XRAY_NEVER_INSTRUMENT {
   // Flush trace data on program exit.
   atexit(funtraceAtExit);
 
+  Report("XRay Funtrace: initialized (ring buffer log2 size = %d)\n",
+         getLogBufSizeLog2());
   return XRayLogInitStatus::XRAY_LOG_INITIALIZED;
 }
 
@@ -219,8 +223,12 @@ static XRayLogFlushStatus funtraceLoggingFlush() XRAY_NEVER_INSTRUMENT {
     if (!Filename)
       Filename = "xray-funtrace.raw";
     Fd = open(Filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (Fd == -1)
+    if (Fd == -1) {
+      Report("XRay Funtrace: failed to open '%s' for writing, errno=%d\n",
+             Filename, errno);
       return XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING;
+    }
+    Report("XRay Funtrace: writing trace to '%s'\n", Filename);
   }
 
   // Write header: magic, version, TSC frequency.
@@ -235,9 +243,11 @@ static XRayLogFlushStatus funtraceLoggingFlush() XRAY_NEVER_INSTRUMENT {
   write(Fd, &Header, sizeof(Header));
 
   // Write each thread's buffer.
+  int ThreadCount = 0;
   {
     SpinMutexLock L(&ThreadListMutex);
     for (auto *N = ThreadList; N; N = N->Next) {
+      ++ThreadCount;
       struct {
         uint64_t Tid;
         uint64_t BufSize;
@@ -260,6 +270,7 @@ static XRayLogFlushStatus funtraceLoggingFlush() XRAY_NEVER_INSTRUMENT {
   }
 
   close(Fd);
+  Report("XRay Funtrace: flushed %d thread(s)\n", ThreadCount);
 
   // Free all buffers.
   {
@@ -303,6 +314,7 @@ bool funtraceLogDynamicInitializer() XRAY_NEVER_INSTRUMENT {
            "error = %d\n",
            RegistrationResult);
 
+  Report("XRay Funtrace: mode registered. xray_mode='%s'\n", flags()->xray_mode);
   if (!internal_strcmp(flags()->xray_mode, "xray-funtrace")) {
     auto SelectResult = __xray_log_select_mode("xray-funtrace");
     if (SelectResult != XRayLogRegisterStatus::XRAY_REGISTRATION_OK) {
