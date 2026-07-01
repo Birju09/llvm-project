@@ -31,6 +31,10 @@ set(XRAY_PROFILING_MODE_SOURCES
   xray_profiling_flags.cpp
   )
 
+set(XRAY_FUNTRACE_MODE_SOURCES
+  xray_funtrace_logging.cpp
+  )
+
 # Implementation files for all XRay architectures.
 set(x86_64_SOURCES
   xray_x86_64.cpp
@@ -58,6 +62,14 @@ set(aarch64_SOURCES
 
 set(aarch64_DSO_SOURCES
   xray_trampoline_AArch64.S
+  )
+
+# Fast funtrace-style trampoline for aarch64 (inline ring buffer writes).
+# To use: replace xray_trampoline_AArch64.S with this in aarch64_SOURCES,
+# or link the funtrace runtime and set XRAY_OPTIONS=xray_mode=xray-funtrace.
+set(aarch64_FUNTRACE_SOURCES
+  xray_AArch64.cpp
+  xray_trampoline_AArch64_fast.S
   )
 
 set(loongarch64_SOURCES
@@ -142,6 +154,7 @@ set(XRAY_IMPL_HEADERS
   xray_fdr_logging.h
   xray_flags.h
   xray_flags.inc
+  xray_funtrace_logging.h
   xray_function_call_trie.h
   xray_interface_internal.h
   xray_powerpc64.inc
@@ -163,6 +176,7 @@ set(XRAY_ALL_SOURCE_FILES
   ${XRAY_FDR_MODE_SOURCES}
   ${XRAY_BASIC_MODE_SOURCES}
   ${XRAY_PROFILING_MODE_SOURCES}
+  ${XRAY_FUNTRACE_MODE_SOURCES}
   ${x86_64_SOURCES}
   ${x86_64_DSO_SOURCES}
   ${arm_SOURCES}
@@ -385,6 +399,13 @@ else() # not Apple
       CFLAGS ${XRAY_CFLAGS}
       DEFS ${XRAY_COMMON_DEFINITIONS}
       DEPS ${XRAY_DEPS})
+    add_compiler_rt_object_libraries(RTXrayFUNTRACE
+      ARCHS ${arch}
+      SOURCES ${XRAY_FUNTRACE_MODE_SOURCES}
+      ADDITIONAL_HEADERS ${XRAY_IMPL_HEADERS}
+      CFLAGS ${XRAY_CFLAGS}
+      DEFS ${XRAY_COMMON_DEFINITIONS}
+      DEPS ${XRAY_DEPS})
 
     # Common XRay archive for instrumented binaries.
     add_compiler_rt_runtime(clang_rt.xray
@@ -425,6 +446,16 @@ else() # not Apple
       LINK_LIBS ${XRAY_LINK_LIBS}
       DEFS ${XRAY_COMMON_DEFINITIONS}
       OBJECT_LIBS RTXrayPROFILING
+      PARENT_TARGET xray)
+    # Funtrace Mode runtime (fast ring buffer logging)
+    add_compiler_rt_runtime(clang_rt.xray-funtrace
+      STATIC
+      ARCHS ${arch}
+      CFLAGS ${XRAY_CFLAGS}
+      LINK_FLAGS ${XRAY_LINK_FLAGS}
+      LINK_LIBS ${XRAY_LINK_LIBS}
+      DEFS ${XRAY_COMMON_DEFINITIONS}
+      OBJECT_LIBS RTXrayFUNTRACE
       PARENT_TARGET xray)
 
     if (${arch} IN_LIST XRAY_DSO_SUPPORTED_ARCH)

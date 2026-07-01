@@ -42,6 +42,36 @@ inline uint64_t getTSCFrequency() XRAY_NEVER_INSTRUMENT {
 #include "xray_x86_64.inc"
 #elif defined(__powerpc64__)
 #include "xray_powerpc64.inc"
+#elif defined(__aarch64__) && (SANITIZER_QNX || SANITIZER_LINUX)
+// On AArch64, we can use the CNTVCT_EL0 virtual counter register directly.
+// This is accessible from EL0 (user mode) and provides a constant-frequency
+// counter, similar to x86's RDTSC. This avoids the overhead of a
+// clock_gettime() syscall (~5x faster per funtrace benchmarks).
+// The counter frequency can be read from CNTFRQ_EL0.
+#include "sanitizer_common/sanitizer_common.h"
+#include "sanitizer_common/sanitizer_internal_defs.h"
+#include "xray_defs.h"
+#include <cstdint>
+
+namespace __xray {
+
+inline bool probeRequiredCPUFeatures() XRAY_NEVER_INSTRUMENT { return true; }
+
+ALWAYS_INLINE uint64_t readTSC(uint8_t &CPU) XRAY_NEVER_INSTRUMENT {
+  uint64_t Count;
+  asm volatile("mrs %0, cntvct_el0" : "=r"(Count));
+  CPU = 0;
+  return Count;
+}
+
+inline uint64_t getTSCFrequency() XRAY_NEVER_INSTRUMENT {
+  uint64_t Freq;
+  asm volatile("mrs %0, cntfrq_el0" : "=r"(Freq));
+  return Freq;
+}
+
+} // namespace __xray
+
 #elif defined(__arm__) || defined(__aarch64__) || defined(__mips__) ||         \
     defined(__hexagon__) || defined(__loongarch_lp64) || defined(__riscv)
 // Emulated TSC.

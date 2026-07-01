@@ -190,15 +190,6 @@ public:
       Report("XRay QNX: restored first_insn=0x%08x last_insn=0x%08x\n",
              First, Last);
     }
-    // AArch64 has non-coherent icache/dcache. The mmap zeroed the pages
-    // (potentially caching zeros in icache), and memcpy restored content
-    // via dcache only. We must invalidate the icache for the entire range
-    // so the CPU fetches the restored instructions, not stale zeros.
-    Report("XRay QNX: calling __clear_cache(%p, %p)\n",
-           PageAlignedAddr,
-           reinterpret_cast<char *>(PageAlignedAddr) + MProtectLen);
-    __clear_cache(reinterpret_cast<char *>(PageAlignedAddr),
-                  reinterpret_cast<char *>(PageAlignedAddr) + MProtectLen);
     Report("XRay QNX: slow path complete, pages are RW\n");
     MustCleanup = true;
     return 0;
@@ -248,6 +239,15 @@ public:
         Report("XRay: mprotect(PROT_READ|PROT_EXEC) failed (errno=%d).\n",
                errno);
       }
+#  if SANITIZER_QNX
+      // Flush icache after pages are R|X. On AArch64, icache and dcache are
+      // not coherent. Must be done after mprotect(R|X) because QNX may fault
+      // on IC IVAU if the page is not executable.
+      if (MpRet == 0) {
+        __clear_cache(reinterpret_cast<char *>(PageAlignedAddr),
+                      reinterpret_cast<char *>(PageAlignedAddr) + MProtectLen);
+      }
+#  endif
 #endif
     }
   }
