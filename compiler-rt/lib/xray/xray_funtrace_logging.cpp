@@ -175,6 +175,11 @@ static void funtraceHandleArg0(int32_t FuncId,
 
 // XRay log interface implementation.
 
+static void funtraceAtExit() XRAY_NEVER_INSTRUMENT {
+  __xray_log_finalize();
+  __xray_log_flushLog();
+}
+
 static XRayLogInitStatus
 funtraceLoggingInit(size_t, size_t, void *, size_t) XRAY_NEVER_INSTRUMENT {
   pthread_key_create(&TLSKey, threadCleanup);
@@ -182,6 +187,9 @@ funtraceLoggingInit(size_t, size_t, void *, size_t) XRAY_NEVER_INSTRUMENT {
 
   // Set the handler for the standard trampoline path.
   __xray_set_handler(funtraceHandleArg0);
+
+  // Flush trace data on program exit.
+  atexit(funtraceAtExit);
 
   return XRayLogInitStatus::XRAY_LOG_INITIALIZED;
 }
