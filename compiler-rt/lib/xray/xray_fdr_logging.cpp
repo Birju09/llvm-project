@@ -36,7 +36,6 @@
 #include "xray_fdr_flags.h"
 #include "xray_fdr_log_writer.h"
 #include "xray_flags.h"
-#include "xray_recursion_guard.h"
 #include "xray_tsc.h"
 #include "xray_utils.h"
 
@@ -87,10 +86,11 @@ static atomic_uint64_t ThresholdTicks{0};
 // Global for ticks per second.
 static atomic_uint64_t TicksPerSec{0};
 
-// Cached result of probeRequiredCPUFeatures(). Initialized during
-// fdrLoggingInit() so getTimestamp() does not need pthread_once() in the
-// per-event hot path.
-static atomic_uint8_t UseRealTSC{1};
+// Cached result of probeRequiredCPUFeatures(). Written once during
+// fdrLoggingInit() (under pthread_once), read on every event. A plain bool is
+// sufficient: the pthread_once memory ordering guarantees visibility to any
+// thread that subsequently calls a handler.
+static bool UseRealTSC = true;
 
 static atomic_sint32_t LogFlushStatus = {
     XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING};
@@ -540,7 +540,7 @@ static TSCAndCPU getTimestamp() XRAY_NEVER_INSTRUMENT {
   // pthread_once() here because this function is called for every FDR event.
   TSCAndCPU Result;
 
-  if (atomic_load(&UseRealTSC, memory_order_acquire)) {
+  if (UseRealTSC) {
     Result.TSC = __xray::readTSC(Result.CPU);
   } else {
     // FIXME: This code needs refactoring as it appears in multiple locations
@@ -556,7 +556,10 @@ static TSCAndCPU getTimestamp() XRAY_NEVER_INSTRUMENT {
   return Result;
 }
 
-thread_local atomic_uint8_t Running{0};
+// Thread-local recursion guard. volatile is sufficient (not atomic) because
+// this is only accessed by the owning thread; volatile ensures signal handlers
+// on the same thread see the updated value.
+thread_local volatile uint8_t Running = 0;
 
 static bool setupTLD(ThreadLocalData &TLD) XRAY_NEVER_INSTRUMENT {
   // Check if we're finalizing, before proceeding.
@@ -640,9 +643,10 @@ static inline bool ensureTLDReady(ThreadLocalData &TLD)
 
 void fdrLoggingHandleArg0(int32_t FuncId,
                           XRayEntryType Entry) XRAY_NEVER_INSTRUMENT {
-  RecursionGuard Guard{Running};
-  if (!Guard)
+  if (Running)
     return;
+  Running = 1;
+  auto ResetRunning = at_scope_exit([] { Running = 0; });
 
   auto *TLD = getThreadLocalData();
   if (UNLIKELY(TLD == nullptr))
@@ -673,9 +677,10 @@ void fdrLoggingHandleArg0(int32_t FuncId,
 
 void fdrLoggingHandleArg1(int32_t FuncId, XRayEntryType Entry,
                           uint64_t Arg) XRAY_NEVER_INSTRUMENT {
-  RecursionGuard Guard{Running};
-  if (!Guard)
+  if (Running)
     return;
+  Running = 1;
+  auto ResetRunning = at_scope_exit([] { Running = 0; });
 
   auto *TLD = getThreadLocalData();
   if (UNLIKELY(TLD == nullptr))
@@ -706,9 +711,10 @@ void fdrLoggingHandleArg1(int32_t FuncId, XRayEntryType Entry,
 
 void fdrLoggingHandleCustomEvent(void *Event,
                                  std::size_t EventSize) XRAY_NEVER_INSTRUMENT {
-  RecursionGuard Guard{Running};
-  if (!Guard)
+  if (Running)
     return;
+  Running = 1;
+  auto ResetRunning = at_scope_exit([] { Running = 0; });
 
   // Complain when we ever get at least one custom event that's larger than what
   // we can possibly support.
@@ -739,9 +745,10 @@ void fdrLoggingHandleCustomEvent(void *Event,
 void fdrLoggingHandleTypedEvent(size_t EventType, const void *Event,
                                 size_t EventSize) noexcept
     XRAY_NEVER_INSTRUMENT {
-  RecursionGuard Guard{Running};
-  if (!Guard)
+  if (Running)
     return;
+  Running = 1;
+  auto ResetRunning = at_scope_exit([] { Running = 0; });
 
   // Complain when we ever get at least one typed event that's larger than what
   // we can possibly support.
@@ -840,8 +847,7 @@ XRayLogInitStatus fdrLoggingInit(size_t, size_t, void *Options,
   pthread_once(
       &OnceInit, +[] {
         const bool TSCSupported = probeRequiredCPUFeatures();
-        atomic_store(&UseRealTSC, TSCSupported ? 1 : 0,
-                     memory_order_release);
+        UseRealTSC = TSCSupported;
         atomic_store(&TicksPerSec,
                      TSCSupported ? getTSCFrequency()
                                   : __xray::NanosecondsPerSecond,
