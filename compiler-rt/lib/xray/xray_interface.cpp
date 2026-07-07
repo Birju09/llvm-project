@@ -17,9 +17,11 @@
 #include <cinttypes>
 #include <cstdio>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #if SANITIZER_FUCHSIA
 #include <zircon/process.h>
@@ -148,38 +150,73 @@ public:
     }
     Report("XRay QNX: fast path (RWX) failed errno=%d, trying slow path\n",
            errno);
-    // Slow path: replace file-backed mapping with anonymous RW copy.
-#  ifndef MAP_ANON
-#    define MAP_ANON MAP_ANONYMOUS
-#  endif
-    Report("XRay QNX: slow path: saving %zu bytes from %p\n",
-           MProtectLen, PageAlignedAddr);
-    auto *Saved = reinterpret_cast<char *>(InternalAlloc(MProtectLen));
-    if (!Saved) {
-      Report("XRay QNX: InternalAlloc(%zu) failed\n", MProtectLen);
+    // Slow path: replace the file-backed R|X mapping with a pre-populated
+    // shm-backed R|W mapping.
+    //
+    // The naive approach — mmap(MAP_FIXED|MAP_ANON) then memcpy to restore —
+    // creates a zero-page window: between MAP_FIXED zeroing the pages and the
+    // subsequent memcpy restoring valid instructions, any thread executing into
+    // the region faults on 0x00000000 (UDF #0 on AArch64), crashing the
+    // process.  This manifests as an intermittent "Memory fault" immediately
+    // after the "restoring..." log line.
+    //
+    // Fix: use shm_open to create a shared memory object and pre-populate it
+    // with the original code through a temporary mapping BEFORE issuing
+    // mmap(MAP_FIXED).  When MAP_FIXED atomically installs the shm pages at
+    // the code address, those pages already contain valid instructions — there
+    // is no zero-window in which another thread can fault.
+    char ShmName[64];
+    internal_snprintf(ShmName, sizeof(ShmName), "/xray_%d_%zx",
+                      internal_getpid(),
+                      reinterpret_cast<uintptr_t>(PageAlignedAddr));
+    int ShmFd = shm_open(ShmName, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (ShmFd < 0) {
+      Report("XRay QNX: shm_open failed errno=%d\n", errno);
       return -1;
     }
-    internal_memcpy(Saved, PageAlignedAddr, MProtectLen);
-    // Verify save: check first and last 4 bytes are non-zero
+    // Unlink immediately; the fd keeps the object alive until mappings close.
+    shm_unlink(ShmName);
+    if (ftruncate(ShmFd, static_cast<off_t>(MProtectLen)) < 0) {
+      Report("XRay QNX: ftruncate failed errno=%d\n", errno);
+      close(ShmFd);
+      return -1;
+    }
+    // Map the shm at a temporary address for pre-population.
+    void *TempMap = mmap(nullptr, MProtectLen, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, ShmFd, 0);
+    if (TempMap == MAP_FAILED) {
+      Report("XRay QNX: mmap(TempMap) failed errno=%d\n", errno);
+      close(ShmFd);
+      return -1;
+    }
+    // Copy the original code into the shm through the temporary mapping.
+    // This happens BEFORE MAP_FIXED, so the target pages are never zero.
+    Report("XRay QNX: slow path: copying %zu bytes from %p to shm\n",
+           MProtectLen, PageAlignedAddr);
+    internal_memcpy(TempMap, PageAlignedAddr, MProtectLen);
     {
       uint32_t First, Last;
-      internal_memcpy(&First, Saved, sizeof(First));
-      internal_memcpy(&Last, Saved + MProtectLen - sizeof(Last), sizeof(Last));
-      Report("XRay QNX: saved first_insn=0x%08x last_insn=0x%08x\n",
+      internal_memcpy(&First, TempMap, sizeof(First));
+      internal_memcpy(&Last,
+                      reinterpret_cast<char *>(TempMap) + MProtectLen -
+                          sizeof(Last),
+                      sizeof(Last));
+      Report("XRay QNX: shm pre-populated first_insn=0x%08x last_insn=0x%08x\n",
              First, Last);
     }
-    void *R = mmap(PageAlignedAddr, MProtectLen, PROT_READ | PROT_WRITE,
-                   MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
+    // Atomically replace the original mapping with the pre-populated shm
+    // mapping.  Other threads executing in this region will see either the old
+    // valid pages (pre-switch) or the new shm pages (post-switch), never zeros.
+    void *R = mmap(PageAlignedAddr, MProtectLen, PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_FIXED | MAP_SHARED, ShmFd, 0);
+    // The fd and temporary mapping are no longer needed once MAP_FIXED succeeds.
+    // The shm object backs the MAP_FIXED mapping; close/munmap are safe here.
+    close(ShmFd);
+    munmap(TempMap, MProtectLen);
     if (R == MAP_FAILED) {
-      Report("XRay QNX: mmap(MAP_FIXED) failed errno=%d\n", errno);
-      InternalFree(Saved);
+      Report("XRay QNX: mmap(MAP_FIXED|shm) failed errno=%d\n", errno);
       return -1;
     }
-    Report("XRay QNX: mmap(MAP_FIXED) at %p returned %p, restoring...\n",
-           PageAlignedAddr, R);
-    internal_memcpy(PageAlignedAddr, Saved, MProtectLen);
-    InternalFree(Saved);
-    // Verify restore: check first and last 4 bytes
     {
       uint32_t First, Last;
       internal_memcpy(&First, PageAlignedAddr, sizeof(First));
@@ -187,10 +224,10 @@ public:
                       reinterpret_cast<char *>(PageAlignedAddr) +
                           MProtectLen - sizeof(Last),
                       sizeof(Last));
-      Report("XRay QNX: restored first_insn=0x%08x last_insn=0x%08x\n",
-             First, Last);
+      Report("XRay QNX: slow path complete (shm), pages RW at %p "
+             "first_insn=0x%08x last_insn=0x%08x\n",
+             R, First, Last);
     }
-    Report("XRay QNX: slow path complete, pages are RW\n");
     MustCleanup = true;
     return 0;
 #else

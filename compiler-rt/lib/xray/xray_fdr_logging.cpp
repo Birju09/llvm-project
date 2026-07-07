@@ -87,6 +87,11 @@ static atomic_uint64_t ThresholdTicks{0};
 // Global for ticks per second.
 static atomic_uint64_t TicksPerSec{0};
 
+// Cached result of probeRequiredCPUFeatures(). Initialized during
+// fdrLoggingInit() so getTimestamp() does not need pthread_once() in the
+// per-event hot path.
+static atomic_uint8_t UseRealTSC{1};
+
 static atomic_sint32_t LogFlushStatus = {
     XRayLogFlushStatus::XRAY_LOG_NOT_FLUSHING};
 
@@ -132,16 +137,29 @@ static atomic_uint64_t SessionGeneration{0};
 static_assert(alignof(ThreadLocalData) >= 64,
               "ThreadLocalData must be cache line aligned.");
 #endif
-static ThreadLocalData &getThreadLocalData() {
+static ThreadLocalData *getThreadLocalData() XRAY_NEVER_INSTRUMENT {
   alignas(ThreadLocalData) thread_local std::byte
       TLDStorage[sizeof(ThreadLocalData)];
 
-  if (pthread_getspecific(Key) == NULL) {
-    new (reinterpret_cast<ThreadLocalData *>(&TLDStorage)) ThreadLocalData{};
-    pthread_setspecific(Key, &TLDStorage);
+  // Avoid pthread_getspecific in the per-event FDR hot path. We only need
+  // pthread_setspecific() once per thread to arrange for the pthread key
+  // destructor to release this thread's buffer at thread exit.
+  thread_local bool TLDInitialized = false;
+  auto *TLD = reinterpret_cast<ThreadLocalData *>(TLDStorage);
+
+  if (UNLIKELY(!TLDInitialized)) {
+    new (TLD) ThreadLocalData{};
+    if (UNLIKELY(pthread_setspecific(Key, TLD) != 0)) {
+      // ThreadLocalData is trivially destructible, but call the destructor
+      // explicitly to match the placement-new lifetime if key registration
+      // fails. Do not free TLDStorage; it is thread-local storage.
+      TLD->~ThreadLocalData();
+      return nullptr;
+    }
+    TLDInitialized = true;
   }
 
-  return *reinterpret_cast<ThreadLocalData *>(&TLDStorage);
+  return TLD;
 }
 
 static XRayFileHeader &fdrCommonHeaderInfo() {
@@ -320,9 +338,9 @@ XRayLogFlushStatus fdrLoggingFlush() XRAY_NEVER_INSTRUMENT {
   });
 
   auto CleanupBuffers = at_scope_exit([] {
-    auto &TLD = getThreadLocalData();
-    if (TLD.Controller != nullptr)
-      TLD.Controller->flush();
+    auto *TLD = getThreadLocalData();
+    if (TLD != nullptr && TLD->Controller != nullptr)
+      TLD->Controller->flush();
   });
 
   if (fdrFlags()->no_file_flush) {
@@ -358,9 +376,9 @@ XRayLogFlushStatus fdrLoggingFlush() XRAY_NEVER_INSTRUMENT {
   // Release the current thread's buffer before we attempt to write out all the
   // buffers. This ensures that in case we had only a single thread going, that
   // we are able to capture the data nonetheless.
-  auto &TLD = getThreadLocalData();
-  if (TLD.Controller != nullptr)
-    TLD.Controller->flush();
+  auto *TLD = getThreadLocalData();
+  if (TLD != nullptr && TLD->Controller != nullptr)
+    TLD->Controller->flush();
 
   BQ->apply([&](const BufferQueue::Buffer &B) {
     // Starting at version 2 of the FDR logging implementation, we only write
@@ -424,10 +442,10 @@ XRayLogFlushStatus fdrLoggingRotate() XRAY_NEVER_INSTRUMENT {
   SleepForMillis(fdrFlags()->grace_period_ms);
 
   // Flush the current thread's in-flight buffer.
-  auto &TLD = getThreadLocalData();
-  if (TLD.Controller != nullptr) {
-    TLD.Controller->flush();
-    TLD.Controller = nullptr;
+  auto *TLD = getThreadLocalData();
+  if (TLD != nullptr && TLD->Controller != nullptr) {
+    TLD->Controller->flush();
+    TLD->Controller = nullptr;
   }
 
   if (!fdrFlags()->no_file_flush) {
@@ -518,18 +536,11 @@ struct TSCAndCPU {
 };
 
 static TSCAndCPU getTimestamp() XRAY_NEVER_INSTRUMENT {
-  // We want to get the TSC as early as possible, so that we can check whether
-  // we've seen this CPU before. We also do it before we load anything else,
-  // to allow for forward progress with the scheduling.
+  // The CPU-feature probe is performed during fdrLoggingInit(). Avoid
+  // pthread_once() here because this function is called for every FDR event.
   TSCAndCPU Result;
 
-  // Test once for required CPU features
-  static pthread_once_t OnceProbe = PTHREAD_ONCE_INIT;
-  static bool TSCSupported = true;
-  pthread_once(
-      &OnceProbe, +[] { TSCSupported = probeRequiredCPUFeatures(); });
-
-  if (TSCSupported) {
+  if (atomic_load(&UseRealTSC, memory_order_acquire)) {
     Result.TSC = __xray::readTSC(Result.CPU);
   } else {
     // FIXME: This code needs refactoring as it appears in multiple locations
@@ -610,29 +621,49 @@ static bool setupTLD(ThreadLocalData &TLD) XRAY_NEVER_INSTRUMENT {
   return true;
 }
 
+static inline bool ensureTLDReady(ThreadLocalData &TLD)
+    XRAY_NEVER_INSTRUMENT {
+  // Fast path for the common case: FDR is initialized, this thread already has
+  // a controller, and no log rotation has advanced the session generation.
+  auto Status = atomic_load(&LoggingStatus, memory_order_acquire);
+  if (UNLIKELY(Status != XRayLogInitStatus::XRAY_LOG_INITIALIZED))
+    return setupTLD(TLD);
+
+  auto CurrentGeneration =
+      atomic_load(&SessionGeneration, memory_order_acquire);
+  if (UNLIKELY(TLD.Controller == nullptr ||
+               TLD.SessionGeneration != CurrentGeneration))
+    return setupTLD(TLD);
+
+  return true;
+}
+
 void fdrLoggingHandleArg0(int32_t FuncId,
                           XRayEntryType Entry) XRAY_NEVER_INSTRUMENT {
-  auto TC = getTimestamp();
-  auto &TSC = TC.TSC;
-  auto &CPU = TC.CPU;
   RecursionGuard Guard{Running};
   if (!Guard)
     return;
 
-  auto &TLD = getThreadLocalData();
-  if (!setupTLD(TLD))
+  auto *TLD = getThreadLocalData();
+  if (UNLIKELY(TLD == nullptr))
     return;
+  if (!ensureTLDReady(*TLD))
+    return;
+
+  auto TC = getTimestamp();
+  auto &TSC = TC.TSC;
+  auto &CPU = TC.CPU;
 
   switch (Entry) {
   case XRayEntryType::ENTRY:
   case XRayEntryType::LOG_ARGS_ENTRY:
-    TLD.Controller->functionEnter(FuncId, TSC, CPU);
+    TLD->Controller->functionEnter(FuncId, TSC, CPU);
     return;
   case XRayEntryType::EXIT:
-    TLD.Controller->functionExit(FuncId, TSC, CPU);
+    TLD->Controller->functionExit(FuncId, TSC, CPU);
     return;
   case XRayEntryType::TAIL:
-    TLD.Controller->functionTailExit(FuncId, TSC, CPU);
+    TLD->Controller->functionTailExit(FuncId, TSC, CPU);
     return;
   case XRayEntryType::CUSTOM_EVENT:
   case XRayEntryType::TYPED_EVENT:
@@ -642,27 +673,30 @@ void fdrLoggingHandleArg0(int32_t FuncId,
 
 void fdrLoggingHandleArg1(int32_t FuncId, XRayEntryType Entry,
                           uint64_t Arg) XRAY_NEVER_INSTRUMENT {
-  auto TC = getTimestamp();
-  auto &TSC = TC.TSC;
-  auto &CPU = TC.CPU;
   RecursionGuard Guard{Running};
   if (!Guard)
     return;
 
-  auto &TLD = getThreadLocalData();
-  if (!setupTLD(TLD))
+  auto *TLD = getThreadLocalData();
+  if (UNLIKELY(TLD == nullptr))
     return;
+  if (!ensureTLDReady(*TLD))
+    return;
+
+  auto TC = getTimestamp();
+  auto &TSC = TC.TSC;
+  auto &CPU = TC.CPU;
 
   switch (Entry) {
   case XRayEntryType::ENTRY:
   case XRayEntryType::LOG_ARGS_ENTRY:
-    TLD.Controller->functionEnterArg(FuncId, TSC, CPU, Arg);
+    TLD->Controller->functionEnterArg(FuncId, TSC, CPU, Arg);
     return;
   case XRayEntryType::EXIT:
-    TLD.Controller->functionExit(FuncId, TSC, CPU);
+    TLD->Controller->functionExit(FuncId, TSC, CPU);
     return;
   case XRayEntryType::TAIL:
-    TLD.Controller->functionTailExit(FuncId, TSC, CPU);
+    TLD->Controller->functionTailExit(FuncId, TSC, CPU);
     return;
   case XRayEntryType::CUSTOM_EVENT:
   case XRayEntryType::TYPED_EVENT:
@@ -672,9 +706,6 @@ void fdrLoggingHandleArg1(int32_t FuncId, XRayEntryType Entry,
 
 void fdrLoggingHandleCustomEvent(void *Event,
                                  std::size_t EventSize) XRAY_NEVER_INSTRUMENT {
-  auto TC = getTimestamp();
-  auto &TSC = TC.TSC;
-  auto &CPU = TC.CPU;
   RecursionGuard Guard{Running};
   if (!Guard)
     return;
@@ -691,20 +722,23 @@ void fdrLoggingHandleCustomEvent(void *Event,
         });
   }
 
-  auto &TLD = getThreadLocalData();
-  if (!setupTLD(TLD))
+  auto *TLD = getThreadLocalData();
+  if (UNLIKELY(TLD == nullptr))
+    return;
+  if (!ensureTLDReady(*TLD))
     return;
 
+  auto TC = getTimestamp();
+  auto &TSC = TC.TSC;
+  auto &CPU = TC.CPU;
+
   int32_t ReducedEventSize = static_cast<int32_t>(EventSize);
-  TLD.Controller->customEvent(TSC, CPU, Event, ReducedEventSize);
+  TLD->Controller->customEvent(TSC, CPU, Event, ReducedEventSize);
 }
 
 void fdrLoggingHandleTypedEvent(size_t EventType, const void *Event,
                                 size_t EventSize) noexcept
     XRAY_NEVER_INSTRUMENT {
-  auto TC = getTimestamp();
-  auto &TSC = TC.TSC;
-  auto &CPU = TC.CPU;
   RecursionGuard Guard{Running};
   if (!Guard)
     return;
@@ -721,13 +755,19 @@ void fdrLoggingHandleTypedEvent(size_t EventType, const void *Event,
         });
   }
 
-  auto &TLD = getThreadLocalData();
-  if (!setupTLD(TLD))
+  auto *TLD = getThreadLocalData();
+  if (UNLIKELY(TLD == nullptr))
+    return;
+  if (!ensureTLDReady(*TLD))
     return;
 
+  auto TC = getTimestamp();
+  auto &TSC = TC.TSC;
+  auto &CPU = TC.CPU;
+
   int32_t ReducedEventSize = static_cast<int32_t>(EventSize);
-  TLD.Controller->typedEvent(TSC, CPU, static_cast<uint16_t>(EventType), Event,
-                             ReducedEventSize);
+  TLD->Controller->typedEvent(TSC, CPU, static_cast<uint16_t>(EventType), Event,
+                              ReducedEventSize);
 }
 
 XRayLogInitStatus fdrLoggingInit(size_t, size_t, void *Options,
@@ -799,9 +839,12 @@ XRayLogInitStatus fdrLoggingInit(size_t, size_t, void *Options,
   static pthread_once_t OnceInit = PTHREAD_ONCE_INIT;
   pthread_once(
       &OnceInit, +[] {
+        const bool TSCSupported = probeRequiredCPUFeatures();
+        atomic_store(&UseRealTSC, TSCSupported ? 1 : 0,
+                     memory_order_release);
         atomic_store(&TicksPerSec,
-                     probeRequiredCPUFeatures() ? getTSCFrequency()
-                                                : __xray::NanosecondsPerSecond,
+                     TSCSupported ? getTSCFrequency()
+                                  : __xray::NanosecondsPerSecond,
                      memory_order_release);
         pthread_key_create(
             &Key, +[](void *TLDPtr) {

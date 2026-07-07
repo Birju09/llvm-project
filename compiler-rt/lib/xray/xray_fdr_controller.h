@@ -22,6 +22,12 @@
 
 namespace __xray {
 
+// Set to 0 for a high-throughput FDR mode that does not rewind short
+// function enter/exit pairs. Default keeps existing behavior.
+#ifndef XRAY_FDR_ENABLE_REWINDING
+#define XRAY_FDR_ENABLE_REWINDING 1
+#endif
+
 template <size_t Version = 5> class FDRController {
   BufferQueue *BQ;
   BufferQueue::Buffer &B;
@@ -63,7 +69,6 @@ template <size_t Version = 5> class FDRController {
     First = true;
     UndoableFunctionEnters = 0;
     UndoableTailExits = 0;
-    atomic_store(B.Extents, 0, memory_order_release);
     return true;
   }
 
@@ -122,16 +127,38 @@ template <size_t Version = 5> class FDRController {
     if (First) {
       First = false;
       W.resetRecord();
-      atomic_store(B.Extents, 0, memory_order_release);
       return setupNewBuffer();
     }
 
     return true;
   }
 
+  bool prepareBufferFast(size_t S) XRAY_NEVER_INSTRUMENT {
+    // Common case: this thread owns a valid buffer, we are not finalizing, the
+    // initial metadata has already been written, and there is enough room.
+    if (LIKELY(BQ != nullptr && B.Data != nullptr && !First &&
+               !BQ->finalizing() && B.Generation == BQ->generation() &&
+               W.getNextRecord() + S <=
+                   reinterpret_cast<char *>(B.Data) + B.Size))
+      return true;
+
+    // Do not call prepareBuffer() through the finalized case; callers already
+    // call returnBuffer() on false. This avoids a double returnBuffer().
+    if (UNLIKELY(finalized()))
+      return false;
+
+    return prepareBuffer(S);
+  }
+
   bool returnBuffer() XRAY_NEVER_INSTRUMENT {
     if (BQ == nullptr)
       return false;
+
+    // The FDR writer keeps extents as thread-local state while the buffer is
+    // owned by this controller. Publish them once before handing the buffer to
+    // the queue/consumer. This removes the per-event atomic extents update from
+    // the hot path.
+    W.publishExtents();
 
     First = true;
     if (finalized()) {
@@ -176,6 +203,14 @@ template <size_t Version = 5> class FDRController {
     }
 
     return PreambleResult::NoChange;
+  }
+
+  bool canUseFastDelta(uint64_t TSC, uint16_t CPU) const
+      XRAY_NEVER_INSTRUMENT {
+    return LatestTSC != 0 && LatestCPU == CPU && TSC >= LatestTSC &&
+           TSC - LatestTSC <=
+               uint64_t{std::numeric_limits<int32_t>::max()} &&
+           B.Generation == BQ->generation();
   }
 
   bool rewindRecords(int32_t FuncId, uint64_t TSC,
@@ -243,45 +278,61 @@ public:
 
   bool functionEnter(int32_t FuncId, uint64_t TSC,
                      uint16_t CPU) XRAY_NEVER_INSTRUMENT {
-    if (finalized() ||
-        !prepareBuffer(sizeof(MetadataRecord) + sizeof(FunctionRecord)))
+    if (!prepareBufferFast(sizeof(MetadataRecord) + sizeof(FunctionRecord)))
       return returnBuffer();
+
+    if (LIKELY(canUseFastDelta(TSC, CPU))) {
+      auto Delta = TSC - LatestTSC;
+      LastFunctionEntryTSC = TSC;
+      LatestTSC = TSC;
+      ++UndoableFunctionEnters;
+      return W.writeFunction(FDRLogWriter::FunctionRecordKind::Enter,
+                             mask(FuncId), Delta);
+    }
 
     auto PreambleStatus = recordPreamble(TSC, CPU);
     if (PreambleStatus == PreambleResult::InvalidBuffer)
       return returnBuffer();
-
     if (PreambleStatus == PreambleResult::WroteMetadata) {
       UndoableFunctionEnters = 1;
       UndoableTailExits = 0;
     } else {
       ++UndoableFunctionEnters;
     }
-
     auto Delta = TSC - LatestTSC;
     LastFunctionEntryTSC = TSC;
     LatestTSC = TSC;
     return W.writeFunction(FDRLogWriter::FunctionRecordKind::Enter,
                            mask(FuncId), Delta);
   }
-
   bool functionTailExit(int32_t FuncId, uint64_t TSC,
                         uint16_t CPU) XRAY_NEVER_INSTRUMENT {
-    if (finalized())
+    if (!prepareBufferFast(sizeof(MetadataRecord) + sizeof(FunctionRecord)))
       return returnBuffer();
 
-    if (!prepareBuffer(sizeof(MetadataRecord) + sizeof(FunctionRecord)))
-      return returnBuffer();
+    if (LIKELY(canUseFastDelta(TSC, CPU))) {
+#if XRAY_FDR_ENABLE_REWINDING
+      if (UndoableFunctionEnters != 0 &&
+          TSC - LastFunctionEntryTSC < CycleThreshold)
+        return rewindRecords(FuncId, TSC, CPU);
+#endif
+      UndoableTailExits = UndoableFunctionEnters ? UndoableTailExits + 1 : 0;
+      UndoableFunctionEnters = 0;
+      auto Delta = TSC - LatestTSC;
+      LatestTSC = TSC;
+      return W.writeFunction(FDRLogWriter::FunctionRecordKind::TailExit,
+                             mask(FuncId), Delta);
+    }
 
     auto PreambleStatus = recordPreamble(TSC, CPU);
     if (PreambleStatus == PreambleResult::InvalidBuffer)
       return returnBuffer();
-
+#if XRAY_FDR_ENABLE_REWINDING
     if (PreambleStatus == PreambleResult::NoChange &&
         UndoableFunctionEnters != 0 &&
         TSC - LastFunctionEntryTSC < CycleThreshold)
       return rewindRecords(FuncId, TSC, CPU);
-
+#endif
     UndoableTailExits = UndoableFunctionEnters ? UndoableTailExits + 1 : 0;
     UndoableFunctionEnters = 0;
     auto Delta = TSC - LatestTSC;
@@ -289,39 +340,48 @@ public:
     return W.writeFunction(FDRLogWriter::FunctionRecordKind::TailExit,
                            mask(FuncId), Delta);
   }
-
   bool functionEnterArg(int32_t FuncId, uint64_t TSC, uint16_t CPU,
                         uint64_t Arg) XRAY_NEVER_INSTRUMENT {
-    if (finalized() ||
-        !prepareBuffer((2 * sizeof(MetadataRecord)) + sizeof(FunctionRecord)) ||
+    if (!prepareBufferFast((2 * sizeof(MetadataRecord)) +
+                           sizeof(FunctionRecord)) ||
         recordPreamble(TSC, CPU) == PreambleResult::InvalidBuffer)
       return returnBuffer();
-
     auto Delta = TSC - LatestTSC;
     LatestTSC = TSC;
     LastFunctionEntryTSC = 0;
     UndoableFunctionEnters = 0;
     UndoableTailExits = 0;
-
     return W.writeFunctionWithArg(FDRLogWriter::FunctionRecordKind::EnterArg,
                                   mask(FuncId), Delta, Arg);
   }
-
   bool functionExit(int32_t FuncId, uint64_t TSC,
                     uint16_t CPU) XRAY_NEVER_INSTRUMENT {
-    if (finalized() ||
-        !prepareBuffer(sizeof(MetadataRecord) + sizeof(FunctionRecord)))
+    if (!prepareBufferFast(sizeof(MetadataRecord) + sizeof(FunctionRecord)))
       return returnBuffer();
+
+    if (LIKELY(canUseFastDelta(TSC, CPU))) {
+#if XRAY_FDR_ENABLE_REWINDING
+      if (UndoableFunctionEnters != 0 &&
+          TSC - LastFunctionEntryTSC < CycleThreshold)
+        return rewindRecords(FuncId, TSC, CPU);
+#endif
+      auto Delta = TSC - LatestTSC;
+      LatestTSC = TSC;
+      UndoableFunctionEnters = 0;
+      UndoableTailExits = 0;
+      return W.writeFunction(FDRLogWriter::FunctionRecordKind::Exit,
+                             mask(FuncId), Delta);
+    }
 
     auto PreambleStatus = recordPreamble(TSC, CPU);
     if (PreambleStatus == PreambleResult::InvalidBuffer)
       return returnBuffer();
-
+#if XRAY_FDR_ENABLE_REWINDING
     if (PreambleStatus == PreambleResult::NoChange &&
         UndoableFunctionEnters != 0 &&
         TSC - LastFunctionEntryTSC < CycleThreshold)
       return rewindRecords(FuncId, TSC, CPU);
-
+#endif
     auto Delta = TSC - LatestTSC;
     LatestTSC = TSC;
     UndoableFunctionEnters = 0;
@@ -329,35 +389,28 @@ public:
     return W.writeFunction(FDRLogWriter::FunctionRecordKind::Exit, mask(FuncId),
                            Delta);
   }
-
   bool customEvent(uint64_t TSC, uint16_t CPU, const void *Event,
                    int32_t EventSize) XRAY_NEVER_INSTRUMENT {
-    if (finalized() ||
-        !prepareBuffer((2 * sizeof(MetadataRecord)) + EventSize) ||
+    if (!prepareBufferFast((2 * sizeof(MetadataRecord)) + EventSize) ||
         recordPreamble(TSC, CPU) == PreambleResult::InvalidBuffer)
       return returnBuffer();
-
     auto Delta = TSC - LatestTSC;
     LatestTSC = TSC;
     UndoableFunctionEnters = 0;
     UndoableTailExits = 0;
     return W.writeCustomEvent(Delta, Event, EventSize);
   }
-
   bool typedEvent(uint64_t TSC, uint16_t CPU, uint16_t EventType,
                   const void *Event, int32_t EventSize) XRAY_NEVER_INSTRUMENT {
-    if (finalized() ||
-        !prepareBuffer((2 * sizeof(MetadataRecord)) + EventSize) ||
+    if (!prepareBufferFast((2 * sizeof(MetadataRecord)) + EventSize) ||
         recordPreamble(TSC, CPU) == PreambleResult::InvalidBuffer)
       return returnBuffer();
-
     auto Delta = TSC - LatestTSC;
     LatestTSC = TSC;
     UndoableFunctionEnters = 0;
     UndoableTailExits = 0;
     return W.writeTypedEvent(Delta, EventType, Event, EventSize);
   }
-
   bool flush() XRAY_NEVER_INSTRUMENT {
     if (finalized()) {
       returnBuffer(); // ignore result.

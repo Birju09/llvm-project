@@ -21,6 +21,14 @@
 
 namespace __xray {
 
+// By default, avoid publishing Buffer.Extents on every FDR record write.
+// The owning thread maintains a local byte count and publishes extents
+// when the buffer is released/flushed. Set this to 1 to restore the
+// conservative per-record publication behavior for debugging.
+#ifndef XRAY_FDR_PUBLISH_EXTENTS_ON_EACH_RECORD
+#define XRAY_FDR_PUBLISH_EXTENTS_ON_EACH_RECORD 0
+#endif
+
 template <size_t Index> struct SerializerImpl {
   template <class Tuple,
             typename std::enable_if<
@@ -78,14 +86,21 @@ class FDRLogWriter {
   BufferQueue::Buffer &Buffer;
   char *NextRecord = nullptr;
 
+  // Number of valid bytes written into Buffer by this writer. This is
+  // thread-owned state and does not need to be atomic on every event.
+  size_t LocalExtents = 0;
+
+  void noteBytesWritten(size_t Bytes) {
+    LocalExtents += Bytes;
+#if XRAY_FDR_PUBLISH_EXTENTS_ON_EACH_RECORD
+    publishExtents();
+#endif
+  }
+
   template <class T> void writeRecord(const T &R) {
     internal_memcpy(NextRecord, reinterpret_cast<const char *>(&R), sizeof(T));
     NextRecord += sizeof(T);
-    // We need this atomic fence here to ensure that other threads attempting to
-    // read the bytes in the buffer will see the writes committed before the
-    // extents are updated.
-    atomic_thread_fence(memory_order_release);
-    atomic_fetch_add(Buffer.Extents, sizeof(T), memory_order_acq_rel);
+    noteBytesWritten(sizeof(T));
   }
 
 public:
@@ -93,6 +108,8 @@ public:
       : Buffer(B), NextRecord(P) {
     DCHECK_NE(Buffer.Data, nullptr);
     DCHECK_NE(NextRecord, nullptr);
+    LocalExtents =
+        static_cast<size_t>(NextRecord - static_cast<char *>(Buffer.Data));
   }
 
   explicit FDRLogWriter(BufferQueue::Buffer &B)
@@ -111,11 +128,7 @@ public:
     constexpr auto Size = sizeof(MetadataRecord) * N;
     internal_memcpy(NextRecord, reinterpret_cast<const char *>(Recs), Size);
     NextRecord += Size;
-    // We need this atomic fence here to ensure that other threads attempting to
-    // read the bytes in the buffer will see the writes committed before the
-    // extents are updated.
-    atomic_thread_fence(memory_order_release);
-    atomic_fetch_add(Buffer.Extents, Size, memory_order_acq_rel);
+    noteBytesWritten(Size);
     return Size;
   }
 
@@ -155,12 +168,7 @@ public:
     NextRecord = reinterpret_cast<char *>(internal_memcpy(
                      NextRecord, reinterpret_cast<char *>(&A), sizeof(A))) +
                  sizeof(A);
-    // We need this atomic fence here to ensure that other threads attempting to
-    // read the bytes in the buffer will see the writes committed before the
-    // extents are updated.
-    atomic_thread_fence(memory_order_release);
-    atomic_fetch_add(Buffer.Extents, sizeof(R) + sizeof(A),
-                     memory_order_acq_rel);
+    noteBytesWritten(sizeof(R) + sizeof(A));
     return true;
   }
 
@@ -180,12 +188,7 @@ public:
                      internal_memcpy(NextRecord, Event, EventSize)) +
                  EventSize;
 
-    // We need this atomic fence here to ensure that other threads attempting to
-    // read the bytes in the buffer will see the writes committed before the
-    // extents are updated.
-    atomic_thread_fence(memory_order_release);
-    atomic_fetch_add(Buffer.Extents, sizeof(R) + EventSize,
-                     memory_order_acq_rel);
+    noteBytesWritten(sizeof(R) + EventSize);
     return true;
   }
 
@@ -203,25 +206,36 @@ public:
                      internal_memcpy(NextRecord, Event, EventSize)) +
                  EventSize;
 
-    // We need this atomic fence here to ensure that other threads attempting to
-    // read the bytes in the buffer will see the writes committed before the
-    // extents are updated.
-    atomic_thread_fence(memory_order_release);
-    atomic_fetch_add(Buffer.Extents, EventSize, memory_order_acq_rel);
+    noteBytesWritten(sizeof(R) + EventSize);
     return true;
   }
 
   char *getNextRecord() const { return NextRecord; }
 
+  size_t currentExtents() const { return LocalExtents; }
+
+  void publishExtents() {
+    // Publish all prior buffer writes before making the extent visible to a
+    // reader/consumer thread. This is intentionally not done for every record
+    // by default; callers publish when returning/flushing the buffer.
+    if (Buffer.Extents != nullptr)
+      atomic_store(Buffer.Extents, LocalExtents, memory_order_release);
+  }
+
   void resetRecord() {
     NextRecord = reinterpret_cast<char *>(Buffer.Data);
-    atomic_store(Buffer.Extents, 0, memory_order_release);
+    LocalExtents = 0;
+    publishExtents();
   }
 
   void undoWrites(size_t B) {
     DCHECK_GE(NextRecord - B, reinterpret_cast<char *>(Buffer.Data));
+    DCHECK_GE(LocalExtents, B);
     NextRecord -= B;
-    atomic_fetch_sub(Buffer.Extents, B, memory_order_acq_rel);
+    LocalExtents -= B;
+#if XRAY_FDR_PUBLISH_EXTENTS_ON_EACH_RECORD
+    publishExtents();
+#endif
   }
 
 }; // namespace __xray

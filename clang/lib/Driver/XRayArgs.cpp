@@ -19,7 +19,8 @@ using namespace clang;
 using namespace clang::driver;
 using namespace llvm::opt;
 
-constexpr const char *XRaySupportedModes[] = {"xray-fdr", "xray-basic"};
+constexpr const char *XRaySupportedModes[] = {"xray-fdr", "xray-basic",
+                                               "xray-funtrace"};
 
 XRayArgs::XRayArgs(const ToolChain &TC, const ArgList &Args) {
   const Driver &D = TC.getDriver();
